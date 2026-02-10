@@ -180,7 +180,6 @@ with tab1:
                     repo_id=SUMMARIZER_REPO,
                     huggingfacehub_api_token=api_token,
                     task="summarization",
-                    # generation params MUST be explicit kwargs (not inside model_kwargs)
                     max_new_tokens=180,
                     do_sample=False,
                     return_full_text=False,
@@ -275,4 +274,3 @@ st.markdown("---")
 st.caption(
     "Notes • This app uses FAISS for vector search and Hugging Face endpoints for LLMs and embeddings."
 )
-``
