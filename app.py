@@ -1,35 +1,36 @@
 
 # app.py
 """
-Streamlit Document Summarization & Q&A (pure Transformers pipelines)
+Streamlit Document Summarization & Q&A (Transformers pipelines, open-source)
 
-What changed vs previous attempts:
-- Removed LangChain HuggingFaceEndpoint (and its pydantic/param issues).
-- Use Hugging Face `transformers` pipelines directly:
-    * Summarization: google/pegasus-cnn_dailymail  (open source)
-    * Q&A (RAG-style generation): google/flan-t5-base (open source)
-- Keep FAISS + MiniLM embeddings for retrieval.
+- Summarizer: sshleifer/distilbart-cnn-12-6   (lightweight BART variant for summarization)
+- Q&A generator: google/flan-t5-base          (instruction-tuned seq2seq)
 
-Install:
+Install (CPU):
     pip install -U streamlit PyPDF2 faiss-cpu langchain-text-splitters langchain-community \
-                   langchain-huggingface transformers sentencepiece torch
+                   langchain-huggingface transformers sentencepiece
 
 Run:
     streamlit run app.py
 """
 
-import os
-import sys
 import gc
-import torch
+import os
 import streamlit as st
+from typing import Dict, Any
 from PyPDF2 import PdfReader
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 
-from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
+# We keep torch optional; if unavailable, pipelines will run on CPU.
+try:
+    import torch
+except Exception:
+    torch = None
+
+from transformers import pipeline
 
 # ---------------------------
 # Page & session setup
@@ -37,7 +38,6 @@ from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
 st.set_page_config(page_title="Document Q&A", layout="wide")
 st.title("📄 Document Summarization & Q&A")
 
-# Session state
 for k, v in {
     "vectorstore": None,
     "text": "",
@@ -58,24 +58,17 @@ st.sidebar.markdown("---")
 st.session_state.debug_raw = st.sidebar.checkbox("Show raw model output", value=False)
 
 # ---------------------------
-# Model selection (fixed, open source)
+# Fixed open-source models
 # ---------------------------
-st.sidebar.header("Models (fixed)")
-st.sidebar.write("- **Summarizer:** `google/pegasus-cnn_dailymail`")
-st.sidebar.write("- **Q&A Generator:** `google/flan-t5-base`")
-
-SUMMARIZER_MODEL = "google/pegasus-cnn_dailymail"
+SUMMARIZER_MODEL = "sshleifer/distilbart-cnn-12-6"
 QA_MODEL = "google/flan-t5-base"
 
-# Device config (CPU/GPU/Apple Silicon)
-if torch.cuda.is_available():
-    device = 0
+# Device note (informative only)
+if torch and torch.cuda.is_available():
     device_note = "CUDA GPU"
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = "mps"
-    device_note = "Apple MPS"
+elif torch and getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+    device_note = "Apple MPS (CPU fallback in pipelines)"
 else:
-    device = -1
     device_note = "CPU"
 st.sidebar.caption(f"Compute device: **{device_note}**")
 
@@ -102,10 +95,10 @@ if uploaded_file:
 if st.button("Process Document") and st.session_state.text:
     with st.spinner("Splitting text and creating embeddings..."):
         try:
-            text_splitter = RecursiveCharacterTextSplitter(
+            splitter = RecursiveCharacterTextSplitter(
                 chunk_size=chunk_size, chunk_overlap=chunk_overlap
             )
-            chunks = text_splitter.split_text(st.session_state.text)
+            chunks = splitter.split_text(st.session_state.text)
             st.session_state.chunks = chunks
 
             embeddings = HuggingFaceEmbeddings(
@@ -121,30 +114,23 @@ if not st.session_state.vectorstore:
     st.stop()
 
 # ---------------------------
-# Lazy-load pipelines
+# Helpers
 # ---------------------------
+def _cuda_kwargs() -> Dict[str, Any]:
+    """Pass device only when CUDA is available; otherwise rely on CPU."""
+    if torch and torch.cuda.is_available():
+        return {"device": 0}
+    return {}
+
 @st.cache_resource(show_spinner=False)
 def load_summarizer():
-    tok = AutoTokenizer.from_pretrained(SUMMARIZER_MODEL)
-    model = AutoModelForSeq2SeqLM.from_pretrained(SUMMARIZER_MODEL)
-    return pipeline(
-        "summarization",
-        model=model,
-        tokenizer=tok,
-        device=device,
-        # Pegasus prefers max_length; for pipelines we can also use max_new_tokens
-    )
+    # DistilBART summarization pipeline
+    return pipeline("summarization", model=SUMMARIZER_MODEL, **_cuda_kwargs())
 
 @st.cache_resource(show_spinner=False)
 def load_qa_generator():
-    tok = AutoTokenizer.from_pretrained(QA_MODEL)
-    model = AutoModelForSeq2SeqLM.from_pretrained(QA_MODEL)
-    return pipeline(
-        "text2text-generation",
-        model=model,
-        tokenizer=tok,
-        device=device,
-    )
+    # FLAN-T5 text2text pipeline
+    return pipeline("text2text-generation", model=QA_MODEL, **_cuda_kwargs())
 
 summarizer = load_summarizer()
 qa_gen = load_qa_generator()
@@ -161,7 +147,7 @@ with tab1:
     st.markdown("**Generate a short summary of the document.**")
     summary_max_input = st.slider(
         "Max input characters to summarize (trim long docs)",
-        256, 8192, 2048, step=256
+        min_value=256, max_value=8192, value=2048, step=256
     )
     target_words = st.slider("Target summary length (words)", 50, 400, 120, 10)
 
@@ -170,19 +156,17 @@ with tab1:
             try:
                 input_text = st.session_state.text[:summary_max_input]
 
-                # Heuristic tokens budget: Pegasus uses subword tokens; map words->tokens ~1.3x
-                # We'll set max_new_tokens based on requested words.
+                # Convert desired words to a rough token budget.
                 approx_tokens = int(target_words * 1.3)
-                # For Pegasus pipeline, `max_length` acts on output length; we can use max_new_tokens as well.
-                # We'll prefer max_new_tokens to be safe across transformer versions.
+
                 outputs = summarizer(
                     input_text,
                     max_new_tokens=approx_tokens,
-                    min_length=30,            # try to avoid overly short summaries
                     do_sample=False,
+                    num_beams=4,
                     truncation=True,
                 )
-                # Pipeline returns a list of dicts with 'summary_text'
+                # Pipeline returns list[dict] with 'summary_text'
                 summary = outputs[0].get("summary_text", "").strip() if outputs else ""
 
                 if st.session_state.debug_raw:
@@ -215,12 +199,15 @@ with tab2:
                 if not docs:
                     st.warning("No relevant documents found.")
                     st.stop()
-                context = "\n\n".join([d.page_content for d in docs])
 
-                # 2) Build prompt for FLAN-T5
+                # Keep context length reasonable
+                # (DistilBART/FLAN-T5 handle ~512-1024 tokens comfortably)
+                context = "\n\n".join([d.page_content for d in docs])[:6000]
+
+                # 2) Prompt for FLAN-T5
                 prompt = (
                     "You are a helpful assistant. Use ONLY the context to answer the question.\n"
-                    "If the answer is not in the context, say 'I don't know based on the provided context.'\n\n"
+                    "If the answer is not in the context, say \"I don't know based on the provided context.\" \n\n"
                     f"Context:\n{context}\n\n"
                     f"Question: {question}\n\n"
                     "Answer concisely in 2-5 sentences."
@@ -231,6 +218,7 @@ with tab2:
                     max_new_tokens=max_tokens_ans,
                     do_sample=False,
                     temperature=0.0,
+                    num_beams=4,
                 )
                 answer = outputs[0].get("generated_text", "").strip() if outputs else ""
 
@@ -255,3 +243,4 @@ with tab2:
 # ---------------------------
 st.markdown("---")
 st.caption("This app uses FAISS for vector search, MiniLM embeddings, and Transformers pipelines for generation.")
+``
