@@ -15,6 +15,8 @@ Notes:
     - This app uses FAISS for local vector search and Hugging Face Inference via LangChain's HuggingFaceEndpoint.
     - IMPORTANT: HuggingFaceEndpoint.invoke() expects a STRING (or messages), not a dict.
     - IMPORTANT: Use 'max_new_tokens' (not 'max_length') for InferenceClient text generation params.
+    - IMPORTANT: Pass generation params (max_new_tokens, do_sample, return_full_text) as explicit kwargs,
+                 not inside model_kwargs (to satisfy pydantic validation).
 """
 
 import os
@@ -173,33 +175,29 @@ with tab1:
             input_text = st.session_state.text[:summary_max_input]
 
             try:
-                # --- Primary summarizer (string input; params via model_kwargs)
+                # --- Primary summarizer (explicit generation kwargs)
                 summarizer = HuggingFaceEndpoint(
                     repo_id=SUMMARIZER_REPO,
                     huggingfacehub_api_token=api_token,
                     task="summarization",
-                    model_kwargs={
-                        # Use max_new_tokens instead of max_length for InferenceClient
-                        "max_new_tokens": 180,
-                        "do_sample": False,
-                        "return_full_text": False
-                    },
+                    # generation params MUST be explicit kwargs (not inside model_kwargs)
+                    max_new_tokens=180,
+                    do_sample=False,
+                    return_full_text=False,
                 )
-                raw = summarizer.invoke(input_text)  # <-- PASS STRING, NOT DICT
+                raw = summarizer.invoke(input_text)
             except Exception:
-                # --- Fallback to instruction model (string input)
+                # --- Fallback to instruction model (explicit generation kwargs)
                 try:
                     fallback_llm = HuggingFaceEndpoint(
                         repo_id=FALLBACK_REPO,
                         huggingfacehub_api_token=api_token,
-                        model_kwargs={
-                            "max_new_tokens": 180,
-                            "do_sample": False,
-                            "return_full_text": False
-                        },
+                        max_new_tokens=180,
+                        do_sample=False,
+                        return_full_text=False,
                     )
                     prompt = "Summarize the following text in 3 sentences:\n\n" + input_text
-                    raw = fallback_llm.invoke(prompt)  # <-- PASS STRING, NOT DICT
+                    raw = fallback_llm.invoke(prompt)
                 except Exception as e2:
                     st.error(f"Summarization failed: {e2}")
                     raw = None
@@ -241,15 +239,13 @@ with tab2:
                 )
                 prompt_text = prompt_template.format(context=context, question=question)
 
-                # 3) Call the LLM endpoint (string input; params via model_kwargs)
+                # 3) Call the LLM endpoint (explicit generation kwargs)
                 qa_llm = HuggingFaceEndpoint(
                     repo_id=QA_REPO,
                     huggingfacehub_api_token=api_token,
-                    model_kwargs={
-                        "max_new_tokens": 256,
-                        "do_sample": False,
-                        "return_full_text": False
-                    },
+                    max_new_tokens=256,
+                    do_sample=False,
+                    return_full_text=False,
                 )
 
                 answer_raw = qa_llm.invoke(prompt_text)
@@ -279,3 +275,4 @@ st.markdown("---")
 st.caption(
     "Notes • This app uses FAISS for vector search and Hugging Face endpoints for LLMs and embeddings."
 )
+``
