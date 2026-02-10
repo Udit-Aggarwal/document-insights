@@ -243,4 +243,3 @@ with tab2:
 # ---------------------------
 st.markdown("---")
 st.caption("This app uses FAISS for vector search, MiniLM embeddings, and Transformers pipelines for generation.")
-``
