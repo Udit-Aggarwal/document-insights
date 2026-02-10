@@ -1,5 +1,5 @@
 
-# app.py
+ app.py
 """
 Streamlit Document Summarization & Q&A
 
@@ -14,6 +14,7 @@ Environment:
 Notes:
     - This app uses FAISS for local vector search and Hugging Face Inference via LangChain's HuggingFaceEndpoint.
     - IMPORTANT: HuggingFaceEndpoint.invoke() expects a STRING (or messages), not a dict.
+    - IMPORTANT: Use 'max_new_tokens' (not 'max_length') for InferenceClient text generation params.
 """
 
 import os
@@ -178,9 +179,10 @@ with tab1:
                     huggingfacehub_api_token=api_token,
                     task="summarization",
                     model_kwargs={
-                        "max_length": 256,
-                        "min_length": 60,
+                        # Use max_new_tokens instead of max_length for InferenceClient
+                        "max_new_tokens": 180,
                         "do_sample": False,
+                        "return_full_text": False
                     },
                 )
                 raw = summarizer.invoke(input_text)  # <-- PASS STRING, NOT DICT
@@ -191,7 +193,9 @@ with tab1:
                         repo_id=FALLBACK_REPO,
                         huggingfacehub_api_token=api_token,
                         model_kwargs={
-                            "max_length": 256,
+                            "max_new_tokens": 180,
+                            "do_sample": False,
+                            "return_full_text": False
                         },
                     )
                     prompt = "Summarize the following text in 3 sentences:\n\n" + input_text
@@ -242,7 +246,9 @@ with tab2:
                     repo_id=QA_REPO,
                     huggingfacehub_api_token=api_token,
                     model_kwargs={
-                        "max_length": 256,
+                        "max_new_tokens": 256,
+                        "do_sample": False,
+                        "return_full_text": False
                     },
                 )
 
