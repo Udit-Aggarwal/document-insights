@@ -10,7 +10,6 @@ Fallback:
 
 Requirements:
   pip install streamlit PyPDF2 langchain-text-splitters langchain-huggingface langchain-community faiss-cpu openai
-  # (and for embeddings)
   pip install sentence-transformers transformers torch
 
 Secrets / env:
@@ -18,13 +17,13 @@ Secrets / env:
   GROQ_API_KEY           (recommended for Groq fallback)
 
 Notes:
-- Uses FAISS for retrieval.
-- Uses HuggingFaceEmbeddings locally for embeddings.
-- Uses chat-completions to avoid provider "text-generation vs conversational" mismatches.
-- Conversational Q&A with multi-turn memory and meta intent handling.
+- FAISS for retrieval, MiniLM embeddings locally.
+- Chat-completions to avoid gen vs chat mismatches.
+- Conversational Q&A with multi-turn memory and robust meta-intent handling (no LLM calls for meta).
 """
 
 import os
+import re
 import traceback
 import streamlit as st
 from PyPDF2 import PdfReader
@@ -54,11 +53,10 @@ if "chunks" not in st.session_state:
     st.session_state.chunks = []
 if "debug_raw" not in st.session_state:
     st.session_state.debug_raw = False
-# Conversational memory for Q&A chat
-# We store a list of {"role": "user"|"assistant", "content": str}
+# Chat history for multi-turn memory (list of dicts with "role" and "content")
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
-# Store last turn's retrieved snippets (to render below the last answer)
+# Store last turn's retrieved snippets (display below last answer)
 if "last_retrieved_docs" not in st.session_state:
     st.session_state.last_retrieved_docs = []
 
@@ -72,10 +70,7 @@ def get_secret(name: str, default=None):
 
 
 def hf_routed_model(model_id: str) -> str:
-    """
-    Force HF Router to use Groq provider.
-    If model already has a provider suffix (e.g. ':groq'), keep it.
-    """
+    """Force HF Router to use Groq provider unless already suffixed."""
     if ":" in model_id:
         return model_id
     return f"{model_id}:groq"
@@ -86,10 +81,7 @@ def normalize_text(s: str) -> str:
 
 
 def openai_chat(client: OpenAI, model: str, messages, temperature: float, max_tokens: int):
-    """
-    Minimal OpenAI-compatible chat call.
-    Returns (content, full_response_object).
-    """
+    """Minimal OpenAI-compatible chat call."""
     resp = client.chat.completions.create(
         model=model,
         messages=messages,
@@ -111,24 +103,11 @@ def llm_chat_with_fallback(
     debug: bool = False,
 ):
     """
-    Primary: HF Router -> Groq provider
-      base_url: https://router.huggingface.co/v1
-      model: <model_id>:groq
-
-    Fallback: Groq direct
-      base_url: https://api.groq.com/openai/v1
-      model: <model_id>
-
-    Returns dict:
-      { "content": str, "primary_used": bool, "raw": resp, "error_primary": str|None, "error_fallback": str|None }
+    Primary: HF Router -> Groq provider (https://router.huggingface.co/v1)
+    Fallback: Groq direct (https://api.groq.com/openai/v1)
     """
-    result = {
-        "content": "",
-        "primary_used": False,
-        "raw": None,
-        "error_primary": None,
-        "error_fallback": None,
-    }
+    result = {"content": "", "primary_used": False, "raw": None,
+              "error_primary": None, "error_fallback": None}
 
     # --- Primary (HF Router)
     if not hf_token:
@@ -141,9 +120,7 @@ def llm_chat_with_fallback(
                 hf_client, routed, messages, temperature=temperature, max_tokens=max_tokens
             )
             if normalize_text(content):
-                result["content"] = content
-                result["primary_used"] = True
-                result["raw"] = raw
+                result.update({"content": content, "primary_used": True, "raw": raw})
                 return result
             else:
                 result["error_primary"] = "Primary returned empty content."
@@ -163,8 +140,7 @@ def llm_chat_with_fallback(
         content, raw = openai_chat(
             groq_client, model_id, messages, temperature=temperature, max_tokens=max_tokens
         )
-        result["content"] = content
-        result["raw"] = raw
+        result.update({"content": content, "raw": raw})
         return result
     except Exception as e:
         result["error_fallback"] = f"{type(e).__name__}: {e}"
@@ -172,28 +148,6 @@ def llm_chat_with_fallback(
             st.write("Fallback exception traceback:")
             st.code(traceback.format_exc())
         return result
-
-
-def build_qa_prompt(context_blocks: list[str], question: str) -> list[dict]:
-    """
-    Build a messages list for chat completion.
-    We tag snippets as [S1], [S2], ... and ask model to cite them.
-    """
-    ctx = "\n\n".join(context_blocks)
-    return [
-        {
-            "role": "system",
-            "content": (
-                "You are a precise assistant. Answer ONLY using the provided snippets.\n"
-                "If the answer is not present, say: 'Not found in the document.'\n"
-                "When you use a snippet, cite it like [S1], [S2]."
-            ),
-        },
-        {
-            "role": "user",
-            "content": f"Snippets:\n{ctx}\n\nQuestion: {question}\nAnswer:",
-        },
-    ]
 
 
 def build_qa_prompt_with_history(
@@ -204,11 +158,10 @@ def build_qa_prompt_with_history(
 ) -> list[dict]:
     """
     History-aware prompt:
-    - Strict system message (grounded answers + citation format, but allow chat-history for meta Qs)
+    - Strict system message preferring snippets; allows chat-history only for meta questions
     - Truncated prior chat history (user/assistant turns)
     - Current user turn with tagged snippets [S1], [S2], ... and question
     """
-    # Keep recent turns only (2 messages per turn)
     msgs = [m for m in history if m.get("role") in ("user", "assistant")]
     if len(msgs) > max_history_turns * 2:
         msgs = msgs[-max_history_turns * 2 :]
@@ -245,66 +198,111 @@ def build_summary_prompt(text: str) -> list[dict]:
                 "Return 5-8 bullet points, concise and information-dense."
             ),
         },
-        {
-            "role": "user",
-            "content": f"Summarize the following document:\n\n{text}",
-        },
+        {"role": "user", "content": f"Summarize the following document:\n\n{text}"},
     ]
 
 
 # ----------------------------
-# Lightweight meta intent routing (chat-about-chat)
+# Robust meta intent & safe history retrieval (NO LLM CALL)
 # ----------------------------
+_META_PATTERNS = {
+    "last_user_q": [
+        r"\b(last|previous)\s+(question|query)\b",
+        r"\bwhat\s+did\s+i\s+ask\b",
+        r"\bmy\s+last\s+question\b",
+    ],
+    "penultimate_user_q": [
+        r"\b(before|prior)\s+to\s+that\b",
+        r"\bquestion\s+before\s+that\b",
+        r"\bprevious\s+to\s+that\b",
+    ],
+    "last_assistant_a": [
+        r"\b(last|previous)\s+(answer|response|reply)\b",
+        r"\bwhat\s+did\s+you\s+say\s+last\b",
+    ],
+    "penultimate_assistant_a": [
+        r"\b(answer|response)\s+before\s+that\b",
+        r"\bprevious\s+answer\s+to\s+that\b",
+    ],
+    "list_user_qs": [
+        r"\b(list|show)\s+(my\s+)?(recent\s+)?(questions|queries)\b",
+    ],
+    "summarize_chat": [
+        r"\b(summarize|recap)\s+(our|the)\s+(chat|conversation)\b",
+        r"\bwhat\s+did\s+we\s+discuss\b",
+    ],
+}
+
+def _match_any(patterns: list[str], text: str) -> bool:
+    return any(re.search(p, text, flags=re.I) for p in patterns)
+
 def detect_meta_intent(q: str) -> str:
-    """
-    Returns one of: 'last_user_q', 'last_assistant_a', 'summarize_chat', 'none'
-    """
-    ql = (q or "").strip().lower()
+    """Return an intent key or 'none'."""
+    ql = (q or "").strip()
     if not ql:
         return "none"
-    triggers_last_q = [
-        "last question", "previous question", "what did i ask", "my last query",
-        "what was the last query", "what was the last question"
-    ]
-    triggers_last_a = [
-        "last answer", "previous answer", "what did you say last time",
-        "what was your last response", "your last reply"
-    ]
-    triggers_summary = [
-        "summarize our chat", "summary of our chat", "summarize conversation",
-        "what did we discuss", "recap our conversation", "recap the chat"
-    ]
-    if any(t in ql for t in triggers_last_q):
-        return "last_user_q"
-    if any(t in ql for t in triggers_last_a):
-        return "last_assistant_a"
-    if any(t in ql for t in triggers_summary):
-        return "summarize_chat"
+    for intent, pats in _META_PATTERNS.items():
+        if _match_any(pats, ql):
+            return intent
     return "none"
 
+def _last_of_role(msgs: list[dict], role: str):
+    for m in reversed(msgs):
+        if m.get("role") == role:
+            return m["content"]
+    return None
+
+def _nth_from_end_of_role(msgs: list[dict], role: str, n: int):
+    """n=1 => last, n=2 => penultimate"""
+    filtered = [m["content"] for m in msgs if m.get("role") == role]
+    return filtered[-n] if len(filtered) >= n else None
 
 def answer_meta_from_history(intent: str, history: list[dict]) -> str:
-    """Return an answer directly from chat_history without hitting RAG."""
+    """
+    Compute deterministic answers from chat_history WITHOUT asking the LLM.
+    Excludes the *current* user message by default.
+    """
     msgs = [m for m in history if m.get("role") in ("user", "assistant")]
     if not msgs:
         return "We haven't chatted yet."
+
     if intent == "last_user_q":
-        for m in reversed(msgs):
-            if m["role"] == "user":
-                return f"Your last question was: {m['content']}"
-        return "I couldn't find your last question."
+        # Exclude current user message (meta-ask) then get last user
+        msgs_excl_current = msgs[:-1] if msgs and msgs[-1]["role"] == "user" else msgs
+        val = _last_of_role(msgs_excl_current, "user")
+        return f"Your last question was: {val}" if val else "I couldn't find your last question."
+
+    if intent == "penultimate_user_q":
+        # n=2 from end, excluding this turn
+        msgs_excl_current = msgs[:-1] if msgs and msgs[-1]["role"] == "user" else msgs
+        val = _nth_from_end_of_role(msgs_excl_current, "user", 2)
+        return f"The question before that was: {val}" if val else "I couldn't find the question before that."
+
     if intent == "last_assistant_a":
-        for m in reversed(msgs):
-            if m["role"] == "assistant":
-                return f"My last answer was: {m['content']}"
-        return "I couldn't find my last answer."
+        val = _last_of_role(msgs, "assistant")
+        return f"My last answer was: {val}" if val else "I couldn't find my last answer."
+
+    if intent == "penultimate_assistant_a":
+        val = _nth_from_end_of_role(msgs, "assistant", 2)
+        return f"The answer before that was: {val}" if val else "I couldn't find the answer before that."
+
+    if intent == "list_user_qs":
+        # List last 5 user questions (excluding this meta-ask, if any)
+        msgs_excl_current = msgs[:-1] if msgs and msgs[-1]["role"] == "user" else msgs
+        qs = [m["content"] for m in msgs_excl_current if m["role"] == "user"][-5:]
+        if not qs:
+            return "No previous questions found."
+        bullets = "\n".join(f"- {q}" for q in qs)
+        return "Here are your recent questions:\n\n" + bullets
+
     if intent == "summarize_chat":
-        last_n = msgs[-16:]  # recap recent context
+        last_n = msgs[-16:]
         lines = []
         for m in last_n:
             who = "You" if m["role"] == "user" else "Assistant"
             lines.append(f"{who}: {m['content']}")
         return "Here is a brief recap of our recent conversation:\n\n" + "\n".join(lines)
+
     return "I'm not sure."
 
 
@@ -325,7 +323,6 @@ temperature = st.sidebar.slider("Temperature", 0.0, 1.5, 0.2, step=0.1)
 st.sidebar.markdown("---")
 st.session_state.debug_raw = st.sidebar.checkbox("Show raw LLM response / debug", value=False)
 
-# Chat memory controls
 st.sidebar.markdown("---")
 st.sidebar.header("Chat Memory")
 max_history_turns = st.sidebar.slider("Max chat turns kept in memory", 2, 20, 8, 1)
@@ -399,7 +396,7 @@ if not groq_key:
 # ----------------------------
 # Tabs
 # ----------------------------
-tab1, tab2 = st.tabs(["📝 Summary", "💬 Q&A (Chat)"])  # chat UX
+tab1, tab2 = st.tabs(["📝 Summary", "💬 Q&A (Chat)"])
 
 
 # ----------------------------
@@ -408,7 +405,6 @@ tab1, tab2 = st.tabs(["📝 Summary", "💬 Q&A (Chat)"])  # chat UX
 with tab1:
     st.markdown("**Generate a short summary of the document.**")
 
-    # For long docs, optionally do a lightweight map-reduce style summary using the already-created chunks.
     use_chunked_summary = st.checkbox("Use chunked summary (better for long documents)", value=True)
     max_input_chars = st.slider("Max characters (non-chunked summary)", 256, 50000, 5000, step=256)
 
@@ -416,8 +412,6 @@ with tab1:
         with st.spinner("Generating summary..."):
             try:
                 if use_chunked_summary and st.session_state.chunks:
-                    # Summarize first N chunks, then combine.
-                    # Keep limits conservative to reduce cost/latency.
                     n_chunks = min(8, len(st.session_state.chunks))
                     mini_summaries = []
 
@@ -439,13 +433,9 @@ with tab1:
                         mini_summaries.append(out["content"] or "")
 
                     final_messages = [
-                        {
-                            "role": "system",
-                            "content": "Combine the bullet points into a single 6-10 bullet executive summary. No extra facts.",
-                        },
+                        {"role": "system", "content": "Combine the bullet points into a single 6-10 bullet executive summary. No extra facts."},
                         {"role": "user", "content": "\n\n".join(mini_summaries)},
                     ]
-
                     result = llm_chat_with_fallback(
                         model_id=model_id,
                         messages=final_messages,
@@ -458,7 +448,6 @@ with tab1:
                 else:
                     input_text = st.session_state.text[: int(max_input_chars)]
                     messages = build_summary_prompt(input_text)
-
                     result = llm_chat_with_fallback(
                         model_id=model_id,
                         messages=messages,
@@ -495,7 +484,6 @@ with tab1:
                             "error_fallback": result["error_fallback"],
                         }
                     )
-
             except Exception as e:
                 st.error("Summarization failed.")
                 st.exception(e)
@@ -522,24 +510,26 @@ with tab2:
     # 3) Chat input pinned at the bottom
     user_question = st.chat_input("Ask a question about the document")
     if user_question:
-        # Store user's message in history
+        # Append current user message to history
         st.session_state.chat_history.append({"role": "user", "content": user_question})
 
         # Route: meta (chat-about-chat) vs RAG
         intent = detect_meta_intent(user_question)
         if intent != "none":
+            # Deterministic, zero-hallucination meta answer (uses history, excludes current turn)
             answer = answer_meta_from_history(intent, st.session_state.chat_history)
             st.session_state.chat_history.append({"role": "assistant", "content": answer})
             st.session_state.last_retrieved_docs = []  # no snippets for meta answers
-            st.rerun()  # re-render so input stays below the newest answer
+            st.rerun()
 
-        # Normal RAG path
+        # Normal RAG path (document-grounded)
         with st.spinner("Retrieving and answering..."):
             try:
                 docs = st.session_state.vectorstore.similarity_search(user_question, k=int(top_k))
                 if not docs:
-                    answer = "No relevant documents found."
-                    st.session_state.chat_history.append({"role": "assistant", "content": answer})
+                    st.session_state.chat_history.append(
+                        {"role": "assistant", "content": "No relevant documents found."}
+                    )
                     st.session_state.last_retrieved_docs = []
                     st.rerun()
 
@@ -587,7 +577,7 @@ with tab2:
                 st.session_state.chat_history.append({"role": "assistant", "content": answer})
                 st.session_state.last_retrieved_docs = [d.page_content for d in docs]
 
-                # Re-render so input stays at the very bottom after new answer
+                # Re-render so input stays at the bottom
                 st.rerun()
 
             except Exception:
@@ -602,5 +592,5 @@ with tab2:
 st.markdown("---")
 st.caption(
     "Notes • FAISS for vector search • HuggingFaceEmbeddings locally • Chat-completions via "
-    "HF Router→Groq with Groq Direct fallback • Conversational memory & meta-intent handling enabled."
+    "HF Router→Groq with Groq Direct fallback • Robust conversational memory & meta-intent handling."
 )
