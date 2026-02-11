@@ -1,6 +1,6 @@
 # app.py
 """
-Streamlit Document Summarization & Q&A (RAG)
+Streamlit Document Summarization & Q&A (RAG, Conversational Memory)
 
 Primary LLM route:
   Hugging Face Router -> Groq provider (OpenAI-compatible chat completions)
@@ -10,6 +10,8 @@ Fallback:
 
 Requirements:
   pip install streamlit PyPDF2 langchain-text-splitters langchain-huggingface langchain-community faiss-cpu openai
+  # (and for embeddings)
+  pip install sentence-transformers transformers torch
 
 Secrets / env:
   HUGGINGFACE_API_TOKEN  (required for HF Router)
@@ -19,6 +21,7 @@ Notes:
 - Uses FAISS for retrieval.
 - Uses HuggingFaceEmbeddings locally for embeddings.
 - Uses chat-completions to avoid provider "text-generation vs conversational" mismatches.
+- Conversational Q&A with multi-turn memory and meta intent handling.
 """
 
 import os
@@ -51,9 +54,13 @@ if "chunks" not in st.session_state:
     st.session_state.chunks = []
 if "debug_raw" not in st.session_state:
     st.session_state.debug_raw = False
-# === NEW: conversational memory container for Q&A chat
+# Conversational memory for Q&A chat
+# We store a list of {"role": "user"|"assistant", "content": str}
 if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []  # list[{"role": "user"|"assistant", "content": str}]
+    st.session_state.chat_history = []
+# Store last turn's retrieved snippets (to render below the last answer)
+if "last_retrieved_docs" not in st.session_state:
+    st.session_state.last_retrieved_docs = []
 
 
 # ----------------------------
@@ -112,7 +119,7 @@ def llm_chat_with_fallback(
       base_url: https://api.groq.com/openai/v1
       model: <model_id>
 
-    Returns dict with:
+    Returns dict:
       { "content": str, "primary_used": bool, "raw": resp, "error_primary": str|None, "error_fallback": str|None }
     """
     result = {
@@ -189,7 +196,6 @@ def build_qa_prompt(context_blocks: list[str], question: str) -> list[dict]:
     ]
 
 
-# === NEW BLOCK START ===
 def build_qa_prompt_with_history(
     history: list[dict],
     context_blocks: list[str],
@@ -198,7 +204,7 @@ def build_qa_prompt_with_history(
 ) -> list[dict]:
     """
     History-aware prompt:
-    - Strict system message (grounded answers + citation format)
+    - Strict system message (grounded answers + citation format, but allow chat-history for meta Qs)
     - Truncated prior chat history (user/assistant turns)
     - Current user turn with tagged snippets [S1], [S2], ... and question
     """
@@ -211,8 +217,9 @@ def build_qa_prompt_with_history(
         {
             "role": "system",
             "content": (
-                "You are a precise assistant. Answer ONLY using the provided snippets.\n"
-                "If the answer is not present, say: 'Not found in the document.'\n"
+                "You are a precise assistant. Prefer answering using the provided document snippets. "
+                "If the user asks about the conversation itself (e.g., last question/answer), use the chat history. "
+                "If the answer is not present in snippets for document-grounded queries, say: 'Not found in the document.' "
                 "When you use a snippet, cite it like [S1], [S2]."
             ),
         }
@@ -227,7 +234,6 @@ def build_qa_prompt_with_history(
         }
     )
     return messages
-# === NEW BLOCK END ===
 
 
 def build_summary_prompt(text: str) -> list[dict]:
@@ -247,6 +253,62 @@ def build_summary_prompt(text: str) -> list[dict]:
 
 
 # ----------------------------
+# Lightweight meta intent routing (chat-about-chat)
+# ----------------------------
+def detect_meta_intent(q: str) -> str:
+    """
+    Returns one of: 'last_user_q', 'last_assistant_a', 'summarize_chat', 'none'
+    """
+    ql = (q or "").strip().lower()
+    if not ql:
+        return "none"
+    triggers_last_q = [
+        "last question", "previous question", "what did i ask", "my last query",
+        "what was the last query", "what was the last question"
+    ]
+    triggers_last_a = [
+        "last answer", "previous answer", "what did you say last time",
+        "what was your last response", "your last reply"
+    ]
+    triggers_summary = [
+        "summarize our chat", "summary of our chat", "summarize conversation",
+        "what did we discuss", "recap our conversation", "recap the chat"
+    ]
+    if any(t in ql for t in triggers_last_q):
+        return "last_user_q"
+    if any(t in ql for t in triggers_last_a):
+        return "last_assistant_a"
+    if any(t in ql for t in triggers_summary):
+        return "summarize_chat"
+    return "none"
+
+
+def answer_meta_from_history(intent: str, history: list[dict]) -> str:
+    """Return an answer directly from chat_history without hitting RAG."""
+    msgs = [m for m in history if m.get("role") in ("user", "assistant")]
+    if not msgs:
+        return "We haven't chatted yet."
+    if intent == "last_user_q":
+        for m in reversed(msgs):
+            if m["role"] == "user":
+                return f"Your last question was: {m['content']}"
+        return "I couldn't find your last question."
+    if intent == "last_assistant_a":
+        for m in reversed(msgs):
+            if m["role"] == "assistant":
+                return f"My last answer was: {m['content']}"
+        return "I couldn't find my last answer."
+    if intent == "summarize_chat":
+        last_n = msgs[-16:]  # recap recent context
+        lines = []
+        for m in last_n:
+            who = "You" if m["role"] == "user" else "Assistant"
+            lines.append(f"{who}: {m['content']}")
+        return "Here is a brief recap of our recent conversation:\n\n" + "\n".join(lines)
+    return "I'm not sure."
+
+
+# ----------------------------
 # Sidebar controls
 # ----------------------------
 st.sidebar.header("Processing Options")
@@ -263,14 +325,14 @@ temperature = st.sidebar.slider("Temperature", 0.0, 1.5, 0.2, step=0.1)
 st.sidebar.markdown("---")
 st.session_state.debug_raw = st.sidebar.checkbox("Show raw LLM response / debug", value=False)
 
-# === NEW BLOCK START ===
+# Chat memory controls
 st.sidebar.markdown("---")
 st.sidebar.header("Chat Memory")
 max_history_turns = st.sidebar.slider("Max chat turns kept in memory", 2, 20, 8, 1)
 if st.sidebar.button("🧹 Clear chat history"):
     st.session_state.chat_history = []
+    st.session_state.last_retrieved_docs = []
     st.toast("Chat history cleared.", icon="🧹")
-# === NEW BLOCK END ===
 
 
 # ----------------------------
@@ -337,7 +399,7 @@ if not groq_key:
 # ----------------------------
 # Tabs
 # ----------------------------
-tab1, tab2 = st.tabs(["📝 Summary", "💬 Q&A (Chat)"])  # === NEW: renamed Q&A tab for chat UX
+tab1, tab2 = st.tabs(["📝 Summary", "💬 Q&A (Chat)"])  # chat UX
 
 
 # ----------------------------
@@ -418,7 +480,6 @@ with tab1:
                             "error_fallback": result["error_fallback"],
                         }
                     )
-                if st.session_state.debug_raw:
                     st.subheader("Raw LLM Response")
                     st.write(result["raw"])
 
@@ -444,93 +505,102 @@ with tab1:
 # Q&A (Chat) tab — Conversational chain with memory
 # ----------------------------
 with tab2:
-    st.markdown("**Chat with the document — multi‑turn Q&A with memory.**")  # === NEW
+    st.markdown("**Chat with the document — multi‑turn Q&A with memory.**")
 
-    # === NEW BLOCK START ===
-    # Render prior conversation
+    # 1) Render prior conversation (above the input)
     for msg in st.session_state.chat_history:
         with st.chat_message("user" if msg["role"] == "user" else "assistant"):
             st.write(msg["content"])
 
-    # Chat input for the next user turn
+    # 2) Show last turn's retrieved snippets (if any)
+    if st.session_state.last_retrieved_docs:
+        with st.expander("Retrieved snippets (last turn)"):
+            for i, txt in enumerate(st.session_state.last_retrieved_docs, start=1):
+                st.markdown(f"**Snippet {i}**")
+                st.write(txt[:1500])
+
+    # 3) Chat input pinned at the bottom
     user_question = st.chat_input("Ask a question about the document")
     if user_question:
-        # Show & store user message
-        with st.chat_message("user"):
-            st.write(user_question)
+        # Store user's message in history
         st.session_state.chat_history.append({"role": "user", "content": user_question})
 
+        # Route: meta (chat-about-chat) vs RAG
+        intent = detect_meta_intent(user_question)
+        if intent != "none":
+            answer = answer_meta_from_history(intent, st.session_state.chat_history)
+            st.session_state.chat_history.append({"role": "assistant", "content": answer})
+            st.session_state.last_retrieved_docs = []  # no snippets for meta answers
+            st.rerun()  # re-render so input stays below the newest answer
+
+        # Normal RAG path
         with st.spinner("Retrieving and answering..."):
             try:
-                # Retrieve top-k chunks for the latest question
                 docs = st.session_state.vectorstore.similarity_search(user_question, k=int(top_k))
                 if not docs:
-                    with st.chat_message("assistant"):
-                        st.write("No relevant documents found.")
-                    st.session_state.chat_history.append(
-                        {"role": "assistant", "content": "No relevant documents found."}
-                    )
-                else:
-                    # Tag snippets for this turn
-                    context_blocks = []
-                    for i, d in enumerate(docs, start=1):
-                        snippet = d.page_content.strip()
-                        context_blocks.append(f"[S{i}] {snippet}")
-
-                    # Build history-aware messages
-                    messages = build_qa_prompt_with_history(
-                        history=st.session_state.chat_history,
-                        context_blocks=context_blocks,
-                        question=user_question,
-                        max_history_turns=max_history_turns,
-                    )
-
-                    # Call LLM with routing & fallback
-                    result = llm_chat_with_fallback(
-                        model_id=model_id,
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        hf_token=hf_token,
-                        groq_key=groq_key,
-                        debug=st.session_state.debug_raw,
-                    )
-
-                    if st.session_state.debug_raw:
-                        st.subheader("Routing / Debug")
-                        st.write(
-                            {
-                                "primary_used": result["primary_used"],
-                                "model_primary": hf_routed_model(model_id),
-                                "model_fallback": model_id,
-                                "error_primary": result["error_primary"],
-                                "error_fallback": result["error_fallback"],
-                            }
-                        )
-                        st.subheader("Raw LLM Response")
-                        st.write(result["raw"])
-
-                    # Show & store assistant reply
-                    answer = normalize_text(result["content"]) or "No answer returned."
-                    with st.chat_message("assistant"):
-                        st.write(answer)
+                    answer = "No relevant documents found."
                     st.session_state.chat_history.append({"role": "assistant", "content": answer})
+                    st.session_state.last_retrieved_docs = []
+                    st.rerun()
 
-                    # Retrieved snippets transparency
-                    with st.expander("Retrieved snippets for this turn"):
-                        for i, d in enumerate(docs, start=1):
-                            st.markdown(f"**Snippet {i}**")
-                            st.write(d.page_content[:1500])
+                # Tag snippets for this turn
+                context_blocks = []
+                for i, d in enumerate(docs, start=1):
+                    snippet = d.page_content.strip()
+                    context_blocks.append(f"[S{i}] {snippet}")
 
-            except Exception as e:
-                with st.chat_message("assistant"):
-                    st.write("Q&A failed.")
-                st.exception(e)
-    # === NEW BLOCK END ===
+                # Build history-aware messages
+                messages = build_qa_prompt_with_history(
+                    history=st.session_state.chat_history,
+                    context_blocks=context_blocks,
+                    question=user_question,
+                    max_history_turns=max_history_turns,
+                )
+
+                # Call LLM with routing & fallback
+                result = llm_chat_with_fallback(
+                    model_id=model_id,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    hf_token=hf_token,
+                    groq_key=groq_key,
+                    debug=st.session_state.debug_raw,
+                )
+
+                if st.session_state.debug_raw:
+                    st.subheader("Routing / Debug")
+                    st.write(
+                        {
+                            "primary_used": result["primary_used"],
+                            "model_primary": hf_routed_model(model_id),
+                            "model_fallback": model_id,
+                            "error_primary": result["error_primary"],
+                            "error_fallback": result["error_fallback"],
+                        }
+                    )
+                    st.subheader("Raw LLM Response")
+                    st.write(result["raw"])
+
+                # Show & store assistant reply
+                answer = normalize_text(result["content"]) or "No answer returned."
+                st.session_state.chat_history.append({"role": "assistant", "content": answer})
+                st.session_state.last_retrieved_docs = [d.page_content for d in docs]
+
+                # Re-render so input stays at the very bottom after new answer
+                st.rerun()
+
+            except Exception:
+                st.session_state.chat_history.append({"role": "assistant", "content": "Q&A failed."})
+                st.session_state.last_retrieved_docs = []
+                st.rerun()
 
 
 # ----------------------------
 # Footer
 # ----------------------------
 st.markdown("---")
-st.caption("Notes • FAISS for vector search • HuggingFaceEmbeddings locally • Chat-completions via HF Router→Groq with Groq Direct fallback • Conversational memory enabled.")
+st.caption(
+    "Notes • FAISS for vector search • HuggingFaceEmbeddings locally • Chat-completions via "
+    "HF Router→Groq with Groq Direct fallback • Conversational memory & meta-intent handling enabled."
+)
