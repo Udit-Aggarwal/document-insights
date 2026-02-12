@@ -11,3 +11,5 @@ langchain-huggingface
 openai
 langchain-qdrant
 qdrant-client
+pymupdf
+pillow
