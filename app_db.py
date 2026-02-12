@@ -1,17 +1,17 @@
 # app.py
 """
-Ultimate Final (Fixed Follow-up / Figure Q&A) — LLaVA-NeXT OCR/vision instead of DeepSeek OCR2
+Ultimate Final (Table-aware + Fixed Follow-ups) — LLaVA v1.6 34B used for OCR/vision enrichment
 
 - Qdrant KB + FAISS fallback
 - HF Router->Groq primary + Groq fallback for LLM chat
 - Vision/OCR enrichment: llava-hf/llava-v1.6-34b-hf via HF Inference (OpenAI compatible)
-- Robust follow-up chaining: reuse last retrieved context for same figure reference
-- Figure-aware retrieval: prioritize figure/caption/OCR chunks for figure questions
+- Robust follow-up chaining: reuse last retrieved context for same figure/table reference
+- Figure+Table-aware retrieval: prioritize caption/OCR/explain chunks for figure/table questions
 
 Refs:
-- LLaVA v1.6-34b-hf prompt template expects "<image>\n<text prompt>" and is Image-Text-to-Text. [1](https://huggingface.co/llava-hf/llava-v1.6-34b-hf)
-- Image-text-to-text message format uses image + text content blocks. [2](https://ollama.com/library/llama3-groq-tool-use:70b)
-- HF base64 images can hit 413 Payload Too Large; compress/resize images. [3](https://deepwiki.com/groq/groq-api-cookbook/9.2-chat-history-management)
+- LLaVA v1.6 34B prompt format is image + text prompt; model card gives template. [1](https://portkey.ai/models/groq/llama-3.1-70b-versatile)
+- Image-text-to-text message format uses image + text content blocks. [3](https://console.groq.com/docs/text-chat)
+- Base64 images can hit 413 Payload Too Large; compress/resize. [2](https://paravisionlab.co.in/text-summarizer/)
 """
 
 import os
@@ -45,8 +45,8 @@ from qdrant_client.http import models as qmodels
 # ----------------------------
 # Page config
 # ----------------------------
-st.set_page_config(page_title="Document Q&A (LLaVA v1.6 34B + Fixed Follow-ups)", layout="wide")
-st.title("📄 Document Summarization & Q&A (LLaVA‑v1.6‑34B for figures + fixed follow-ups)")
+st.set_page_config(page_title="Document Q&A (LLaVA v1.6 34B + Tables)", layout="wide")
+st.title("📄 Document Summarization & Q&A (LLaVA‑v1.6‑34B + Table-aware RAG)")
 
 
 # ----------------------------
@@ -133,16 +133,11 @@ if "session_id" not in st.session_state:
 # follow-up context cache
 if "last_context_blocks" not in st.session_state:
     st.session_state.last_context_blocks = []
-if "last_question" not in st.session_state:
-    st.session_state.last_question = ""
-if "last_answer" not in st.session_state:
-    st.session_state.last_answer = ""
-if "last_figure_ref" not in st.session_state:
-    st.session_state.last_figure_ref = None  # e.g. "figure 2"
+if "last_ref" not in st.session_state:
+    st.session_state.last_ref = None  # e.g. "figure 2" or "table 3"
 
 SESSION_ID = st.session_state.session_id
 init_chat_db()
-
 if "history_synced" not in st.session_state:
     st.session_state.chat_history = load_history(SESSION_ID)
     st.session_state.history_synced = True
@@ -224,11 +219,11 @@ def llm_chat_with_fallback(
 # ----------------------------
 # Vision/OCR enrichment: LLaVA v1.6 34B via HF token
 # ----------------------------
-LLAVA_MODEL = "llava-hf/llava-v1.6-34b-hf"  # [1](https://huggingface.co/llava-hf/llava-v1.6-34b-hf)
+LLAVA_MODEL = "llava-hf/llava-v1.6-34b-hf"  # [1](https://portkey.ai/models/groq/llama-3.1-70b-versatile)
 
 def image_to_data_url(img: Image.Image, max_bytes: int = 650_000) -> str:
     """
-    Compress & downscale to reduce risk of HF 413 Payload Too Large for base64 image payloads. [3](https://deepwiki.com/groq/groq-api-cookbook/9.2-chat-history-management)
+    Compress & downscale to reduce risk of HF 413 Payload Too Large for base64 image payloads. [2](https://paravisionlab.co.in/text-summarizer/)
     """
     img = img.convert("RGB")
     max_side = 1300
@@ -253,7 +248,7 @@ def image_to_data_url(img: Image.Image, max_bytes: int = 650_000) -> str:
 
 def llava_vision_call(hf_token: str, img: Image.Image, prompt: str, max_tokens: int = 900, retries: int = 2) -> str:
     """
-    Call LLaVA v1.6 34B as an image-text-to-text model. [1](https://huggingface.co/llava-hf/llava-v1.6-34b-hf)[2](https://ollama.com/library/llama3-groq-tool-use:70b)
+    Call LLaVA v1.6 34B as an image-text-to-text model. [1](https://portkey.ai/models/groq/llama-3.1-70b-versatile)[3](https://console.groq.com/docs/text-chat)
     """
     if not hf_token:
         return ""
@@ -261,7 +256,6 @@ def llava_vision_call(hf_token: str, img: Image.Image, prompt: str, max_tokens: 
     data_url = image_to_data_url(img)
     client = OpenAI(base_url="https://api-inference.huggingface.co/v1/", api_key=hf_token)
 
-    # image-text-to-text style chat content blocks: image_url + text [2](https://ollama.com/library/llama3-groq-tool-use:70b)
     messages = [{
         "role": "user",
         "content": [
@@ -284,7 +278,6 @@ def llava_vision_call(hf_token: str, img: Image.Image, prompt: str, max_tokens: 
         except Exception as e:
             last_err = str(e)
             if "413" in last_err or "Payload Too Large" in last_err:
-                # Compress harder and retry [3](https://deepwiki.com/groq/groq-api-cookbook/9.2-chat-history-management)
                 data_url = image_to_data_url(img, max_bytes=450_000)
                 messages[0]["content"][0]["image_url"]["url"] = data_url
             time.sleep(1.0)
@@ -307,7 +300,7 @@ def to_sub(text: str) -> str:
 def extract_text_with_scripts(page) -> str:
     """
     Best-effort: superscript via flags + geometry; subscript via geometry.
-    OCR enrichment below will cover missed cases.
+    OCR enrichment below covers missed cases.
     """
     d = page.get_text("dict")
     out_lines = []
@@ -359,13 +352,21 @@ def extract_text_with_scripts(page) -> str:
 
 
 # ----------------------------
-# PDF ingestion with LLaVA enrichment
+# Table/Figure caption extraction
 # ----------------------------
 FIG_CAPTION_RE = re.compile(r"^\s*(fig\.?|figure)\s*\d+[:.\-\s]", re.IGNORECASE)
+TABLE_CAPTION_RE = re.compile(r"^\s*(tab\.?|table)\s*\d+[:.\-\s]", re.IGNORECASE)
 
 def extract_fig_captions(text: str) -> List[str]:
     return [ln.strip() for ln in (text or "").splitlines() if FIG_CAPTION_RE.match(ln)]
 
+def extract_table_captions(text: str) -> List[str]:
+    return [ln.strip() for ln in (text or "").splitlines() if TABLE_CAPTION_RE.match(ln)]
+
+
+# ----------------------------
+# PDF ingestion with LLaVA enrichment (table-aware)
+# ----------------------------
 def render_page_image(page, dpi: int = 180) -> Image.Image:
     pix = page.get_pixmap(dpi=dpi)
     return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
@@ -376,14 +377,13 @@ def extract_pdf_artifacts_with_llava(
     hf_token: str,
     do_page_ocr: bool,
     do_image_ocr: bool,
-    do_figure_explain: bool,
+    do_visual_explain: bool,
     page_ocr_mode: str,
 ) -> Tuple[str, List[str]]:
     """
-    For OCR-like transcription, we prompt LLaVA explicitly to transcribe text.
-    For figure explanation, we ask for structured explanation.
-
-    LLaVA expects image + text prompt. [1](https://huggingface.co/llava-hf/llava-v1.6-34b-hf)
+    Table-aware enrichment:
+    - If a page contains a Table caption, we force page OCR even in 'auto' mode to capture the table contents.
+    - OCR prompts request markdown tables when tables appear.
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     all_pages_text = []
@@ -394,27 +394,35 @@ def extract_pdf_artifacts_with_llava(
 
         # 1) Native text + captions
         page_text = extract_text_with_scripts(page)
-        if page_text:
-            all_pages_text.append(f"[PAGE {pno+1}]\n{page_text}")
-            for cap in extract_fig_captions(page_text):
-                extras.append(f"[FIGURE_CAPTION][PAGE {pno+1}] {cap}")
-        else:
-            all_pages_text.append(f"[PAGE {pno+1}]\n")
+        all_pages_text.append(f"[PAGE {pno+1}]\n{page_text or ''}".strip())
 
-        # 2) Page OCR-like transcription (use when text extraction is weak)
+        # capture captions
+        for cap in extract_fig_captions(page_text):
+            extras.append(f"[FIGURE_CAPTION][PAGE {pno+1}] {cap}")
+        for cap in extract_table_captions(page_text):
+            extras.append(f"[TABLE_CAPTION][PAGE {pno+1}] {cap}")
+
+        # 2) Page OCR-like transcription
         if do_page_ocr and hf_token:
-            should_ocr = True if page_ocr_mode == "all" else (len(page_text) < 60)
+            has_table_caption = any(TABLE_CAPTION_RE.match(ln) for ln in (page_text or "").splitlines())
+            should_ocr = (page_ocr_mode == "all") or (len(page_text) < 60) or has_table_caption
+
             if should_ocr:
                 img = render_page_image(page, dpi=180)
                 prompt = (
-                    "Transcribe ALL visible text from this image EXACTLY. "
-                    "Preserve line breaks. If there is a chart/table, include axis labels, legends, titles."
+                    "Transcribe ALL visible text EXACTLY. Preserve line breaks.\n"
+                    "If there is ANY TABLE, output it as a MARKDOWN TABLE.\n"
+                    "If there is a chart, include axis labels, legend entries, titles, annotations."
                 )
-                ocr = llava_vision_call(hf_token, img, prompt, max_tokens=1200, retries=2)
+                ocr = llava_vision_call(hf_token, img, prompt, max_tokens=1400, retries=2)
                 if ocr:
-                    extras.append(f"[PAGE_OCR][PAGE {pno+1}] {ocr}")
+                    # If we forced OCR due to table caption, mark it as table OCR as well
+                    if has_table_caption and ("|" in ocr or "table" in ocr.lower()):
+                        extras.append(f"[TABLE_OCR][PAGE {pno+1}] {ocr}")
+                    else:
+                        extras.append(f"[PAGE_OCR][PAGE {pno+1}] {ocr}")
 
-        # 3) Embedded image OCR + optional explanation
+        # 3) Embedded image OCR + optional explain
         if do_image_ocr and hf_token:
             try:
                 img_list = page.get_images(full=True)
@@ -428,24 +436,35 @@ def extract_pdf_artifacts_with_llava(
                     img_bytes = base.get("image", b"")
                     if not img_bytes or len(img_bytes) < 1500:
                         continue
+
                     pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
 
                     prompt_ocr = (
-                        "Transcribe ALL visible text from this figure EXACTLY. "
-                        "Preserve line breaks. Include axis labels, legend entries, and any annotations."
+                        "Transcribe ALL visible text EXACTLY.\n"
+                        "If this is a TABLE, output it as a MARKDOWN TABLE.\n"
+                        "Include headers and all rows you can read."
                     )
-                    ocr = llava_vision_call(hf_token, pil_img, prompt_ocr, max_tokens=900, retries=2)
+                    ocr = llava_vision_call(hf_token, pil_img, prompt_ocr, max_tokens=1000, retries=2)
                     if ocr:
-                        extras.append(f"[FIGURE_OCR][PAGE {pno+1}][IMG {idx}] {ocr}")
+                        # heuristically tag as table OCR if looks like markdown table
+                        if "|" in ocr and "\n" in ocr:
+                            extras.append(f"[TABLE_OCR][PAGE {pno+1}][IMG {idx}] {ocr}")
+                        else:
+                            extras.append(f"[FIGURE_OCR][PAGE {pno+1}][IMG {idx}] {ocr}")
 
-                    if do_figure_explain:
+                    if do_visual_explain:
                         prompt_explain = (
-                            "Explain this figure clearly. "
-                            "Describe what it shows, the axes/legend, key trends, and the main takeaway."
+                            "Explain this visual content clearly.\n"
+                            "If it's a TABLE: summarize what each column means, highlight key values/patterns, and the main takeaway.\n"
+                            "If it's a FIGURE: describe axes/legend, key trends, and the main takeaway."
                         )
                         expl = llava_vision_call(hf_token, pil_img, prompt_explain, max_tokens=900, retries=2)
                         if expl:
-                            extras.append(f"[FIGURE_EXPLAIN][PAGE {pno+1}][IMG {idx}] {expl}")
+                            # tag based on whether OCR looked table-like
+                            if ocr and ("|" in ocr):
+                                extras.append(f"[TABLE_EXPLAIN][PAGE {pno+1}][IMG {idx}] {expl}")
+                            else:
+                                extras.append(f"[FIGURE_EXPLAIN][PAGE {pno+1}][IMG {idx}] {expl}")
 
                 except Exception:
                     continue
@@ -484,20 +503,30 @@ def init_qdrant_vectorstore() -> Tuple[Optional[QdrantVectorStore], Optional[str
 
 
 # ----------------------------
-# Retrieval helpers (figure-aware + follow-up reuse)
+# Retrieval helpers (table/figure aware + follow-up reuse)
 # ----------------------------
 FIGURE_REF_RE = re.compile(r"\b(fig(?:ure)?\.?)\s*(\d+)\b", re.IGNORECASE)
+TABLE_REF_RE = re.compile(r"\b(tab(?:le)?\.?)\s*(\d+)\b", re.IGNORECASE)
 
-def extract_figure_ref(q: str) -> Optional[str]:
-    m = FIGURE_REF_RE.search(q or "")
-    if not m:
-        return None
-    return f"figure {m.group(2)}"
+def extract_ref(q: str) -> Optional[str]:
+    q = q or ""
+    m = FIGURE_REF_RE.search(q)
+    if m:
+        return f"figure {m.group(2)}"
+    m = TABLE_REF_RE.search(q)
+    if m:
+        return f"table {m.group(2)}"
+    return None
 
-def is_figure_question(q: str) -> bool:
-    return bool(re.search(r"\b(fig|figure|diagram|chart|graph|image)\b", q or "", flags=re.I))
+def is_visual_question(q: str) -> bool:
+    return bool(re.search(r"\b(fig|figure|diagram|chart|graph|image|table|tab)\b", q or "", flags=re.I))
 
-FIGURE_TYPES = {"figure_explain", "figure_ocr", "figure_caption", "page_ocr"}
+# prioritize these chunk types for table/figure questions
+VISUAL_TYPES = {
+    "figure_explain", "figure_ocr", "figure_caption",
+    "table_explain", "table_ocr", "table_caption",
+    "page_ocr"
+}
 
 def qdrant_filter_for_chunk_types(types: List[str]) -> Optional[qmodels.Filter]:
     should = []
@@ -505,19 +534,19 @@ def qdrant_filter_for_chunk_types(types: List[str]) -> Optional[qmodels.Filter]:
         should.append(qmodels.FieldCondition(key=path, match=qmodels.MatchAny(any=types)))
     return qmodels.Filter(should=should)
 
-def retrieve_docs(vectorstore, query: str, k: int, prefer_figure: bool) -> List:
+def retrieve_docs(vectorstore, query: str, k: int, prefer_visual: bool) -> List:
     docs_all: List = []
 
-    if prefer_figure and isinstance(vectorstore, QdrantVectorStore):
+    if prefer_visual and isinstance(vectorstore, QdrantVectorStore):
         try:
-            flt = qdrant_filter_for_chunk_types(list(FIGURE_TYPES))
-            docs_fig = vectorstore.similarity_search(query, k=min(12, k), filter=flt)
-            docs_all.extend(docs_fig)
+            flt = qdrant_filter_for_chunk_types(list(VISUAL_TYPES))
+            docs_vis = vectorstore.similarity_search(query, k=min(12, max(k, 10)), filter=flt)
+            docs_all.extend(docs_vis)
         except Exception:
             pass
 
     try:
-        docs_gen = vectorstore.similarity_search(query, k=k)
+        docs_gen = vectorstore.similarity_search(query, k=max(k, 6))
         docs_all.extend(docs_gen)
     except Exception:
         return []
@@ -532,19 +561,19 @@ def retrieve_docs(vectorstore, query: str, k: int, prefer_figure: bool) -> List:
             seen.add(key)
             uniq.append(d)
 
-    # For FAISS: push figure chunk types first if possible
-    if prefer_figure and not isinstance(vectorstore, QdrantVectorStore):
-        fig_first, rest = [], []
+    # For FAISS: push visual chunk types first if possible
+    if prefer_visual and not isinstance(vectorstore, QdrantVectorStore):
+        vis_first, rest = [], []
         for d in uniq:
             md = getattr(d, "metadata", {}) or {}
             ctype = (md.get("chunk_type") or "").lower()
-            if ctype in FIGURE_TYPES:
-                fig_first.append(d)
+            if ctype in VISUAL_TYPES:
+                vis_first.append(d)
             else:
                 rest.append(d)
-        uniq = fig_first + rest
+        uniq = vis_first + rest
 
-    return uniq[:max(k, 10) if prefer_figure else k]
+    return uniq[:max(k, 10) if prefer_visual else k]
 
 
 # ----------------------------
@@ -570,8 +599,8 @@ st.sidebar.markdown("---")
 st.sidebar.header("LLaVA Enrichment")
 do_page_ocr = st.sidebar.checkbox("Page OCR-like transcription", value=True)
 page_ocr_mode = st.sidebar.selectbox("Page OCR mode", ["auto", "all"], index=0)
-do_image_ocr = st.sidebar.checkbox("OCR embedded images (figures)", value=True)
-do_figure_explain = st.sidebar.checkbox("Explain figures (adds figure explanation chunks)", value=True)
+do_image_ocr = st.sidebar.checkbox("OCR embedded images (figures/tables)", value=True)
+do_visual_explain = st.sidebar.checkbox("Explain visual content (tables/figures)", value=True)
 
 st.sidebar.markdown("---")
 st.sidebar.header("Chat Memory")
@@ -580,9 +609,7 @@ if st.sidebar.button("🧹 Clear chat history"):
     st.session_state.chat_history = []
     st.session_state.last_retrieved_docs = []
     st.session_state.last_context_blocks = []
-    st.session_state.last_question = ""
-    st.session_state.last_answer = ""
-    st.session_state.last_figure_ref = None
+    st.session_state.last_ref = None
     clear_history(SESSION_ID)
     st.toast("Chat history cleared.", icon="🧹")
 
@@ -654,7 +681,8 @@ def build_qa_prompt_with_history(history, context_blocks, question, max_history_
             "You are a precise assistant. Answer using ONLY the provided snippets. "
             "If the answer is not present in snippets, say: 'Not found in the knowledge base.' "
             "Cite snippet IDs like [S1], [S2]. "
-            "For figure questions, prioritize [FIGURE_EXPLAIN], [FIGURE_OCR], [FIGURE_CAPTION], [PAGE_OCR] snippets."
+            "For TABLE questions, prioritize [TABLE_EXPLAIN], [TABLE_OCR], [TABLE_CAPTION], [PAGE_OCR] snippets. "
+            "For FIGURE questions, prioritize [FIGURE_EXPLAIN], [FIGURE_OCR], [FIGURE_CAPTION], [PAGE_OCR] snippets."
         ),
     }]
     messages.extend(msgs)
@@ -665,7 +693,7 @@ def build_qa_prompt_with_history(history, context_blocks, question, max_history_
 
 
 # ----------------------------
-# Deterministic "chat-about-chat" (no hallucination)
+# Deterministic "chat-about-chat"
 # ----------------------------
 _META_PATTERNS = {
     "last_user_q": [r"\b(last|previous)\s+(question|query)\b", r"\bwhat\s+did\s+i\s+ask\b", r"\bmy\s+last\s+question\b"],
@@ -719,7 +747,7 @@ if uploaded_file:
                 hf_token=hf_token or "",
                 do_page_ocr=bool(do_page_ocr and hf_token),
                 do_image_ocr=bool(do_image_ocr and hf_token),
-                do_figure_explain=bool(do_figure_explain and hf_token),
+                do_visual_explain=bool(do_visual_explain and hf_token),
                 page_ocr_mode=page_ocr_mode,
             )
             st.session_state.text = main_text
@@ -730,14 +758,14 @@ if uploaded_file:
 
         st.success(f"Document loaded: {len(st.session_state.text)} characters")
         if getattr(st.session_state, "_extra_texts", []):
-            st.info(f"LLaVA extracted {len(st.session_state._extra_texts)} extra snippets (OCR/captions/figure explain).")
+            st.info(f"LLaVA extracted {len(st.session_state._extra_texts)} extra snippets (OCR/captions/table/figure explain).")
         if uploaded_file.type == "application/pdf" and not hf_token:
             st.warning("LLaVA enrichment is disabled because HUGGINGFACE_API_TOKEN is missing.")
     except Exception as e:
         st.error(f"Failed to read uploaded file: {e}")
 
 if st.button("Process Document") and st.session_state.text:
-    with st.spinner("Chunking + embedding + storing in KB (incl. LLaVA enrichment)..."):
+    with st.spinner("Chunking + embedding + storing in KB (incl. LLaVA table/figure enrichment)..."):
         try:
             ensure_vectorstore()
             splitter = RecursiveCharacterTextSplitter(chunk_size=int(chunk_size), chunk_overlap=int(chunk_overlap))
@@ -765,6 +793,7 @@ if st.button("Process Document") and st.session_state.text:
             metadatas = []
             for t in all_texts:
                 m = dict(meta_base)
+                # chunk types
                 if t.startswith("[PAGE_OCR]"):
                     m["chunk_type"] = "page_ocr"
                 elif t.startswith("[FIGURE_OCR]"):
@@ -773,6 +802,12 @@ if st.button("Process Document") and st.session_state.text:
                     m["chunk_type"] = "figure_explain"
                 elif t.startswith("[FIGURE_CAPTION]"):
                     m["chunk_type"] = "figure_caption"
+                elif t.startswith("[TABLE_OCR]"):
+                    m["chunk_type"] = "table_ocr"
+                elif t.startswith("[TABLE_EXPLAIN]"):
+                    m["chunk_type"] = "table_explain"
+                elif t.startswith("[TABLE_CAPTION]"):
+                    m["chunk_type"] = "table_caption"
                 else:
                     m["chunk_type"] = "main_text"
                 metadatas.append(m)
@@ -787,7 +822,7 @@ if st.button("Process Document") and st.session_state.text:
                 if isinstance(st.session_state.vectorstore, FAISS):
                     save_faiss(st.session_state.vectorstore)
                 st.session_state.kb_ready = True
-                st.success(f"Stored {len(all_texts)} chunks in KB (incl. LLaVA enrichment).")
+                st.success(f"Stored {len(all_texts)} chunks in KB (incl. table/figure chunks).")
 
         except Exception as e:
             st.error(f"Failed to process document: {e}")
@@ -859,7 +894,7 @@ with tab1:
 
 
 # ----------------------------
-# Q&A tab — FIXED follow-up figure behaviour
+# Q&A tab — Table/figure aware + follow-up reuse + anti-false-not-found
 # ----------------------------
 with tab2:
     st.markdown("**Chat with the Knowledge Base — multi‑turn memory enabled.**")
@@ -896,18 +931,17 @@ with tab2:
             st.session_state.last_context_blocks = []
             st.rerun()
 
-        fig_ref = extract_figure_ref(user_question)
-        prefer_figure = is_figure_question(user_question)
+        ref = extract_ref(user_question)
+        prefer_visual = is_visual_question(user_question)
 
-        reuse_prior = (fig_ref is not None and fig_ref == st.session_state.last_figure_ref and len(st.session_state.last_context_blocks) > 0)
+        reuse_prior = (ref is not None and ref == st.session_state.last_ref and len(st.session_state.last_context_blocks) > 0)
 
-        k = max(int(top_k), 10) if prefer_figure else int(top_k)
+        k = max(int(top_k), 10) if prefer_visual else int(top_k)
 
         with st.spinner("Retrieving and answering..."):
             try:
-                docs = retrieve_docs(st.session_state.vectorstore, user_question, k=k, prefer_figure=prefer_figure)
+                docs = retrieve_docs(st.session_state.vectorstore, user_question, k=k, prefer_visual=prefer_visual)
 
-                # If no docs but we have prior context for same figure, proceed with prior
                 if not docs and reuse_prior:
                     context_blocks = st.session_state.last_context_blocks
                     last_snips = st.session_state.last_retrieved_docs
@@ -917,7 +951,7 @@ with tab2:
                     append_message(SESSION_ID, "assistant", answer)
                     st.session_state.last_retrieved_docs = []
                     st.session_state.last_context_blocks = []
-                    st.session_state.last_figure_ref = fig_ref
+                    st.session_state.last_ref = ref
                     st.rerun()
                 else:
                     context_blocks = []
@@ -928,7 +962,6 @@ with tab2:
                             context_blocks.append(f"[S{i}] {snippet}")
                             last_snips.append(snippet)
 
-                    # Merge prior context for same figure follow-up
                     if reuse_prior:
                         merged = []
                         seen = set()
@@ -958,7 +991,7 @@ with tab2:
 
                 answer = normalize_text(result["content"]) or "No answer returned."
 
-                # Anti-false-not-found retry (if we have context)
+                # Anti-false-not-found retry if we have context
                 if ("not found in the knowledge base" in answer.lower() or answer.strip().lower() == "not found in the knowledge base.") and len(context_blocks) > 0:
                     retry_msgs = [
                         {"role": "system", "content": "You MUST answer using the snippets below. Do NOT say 'Not found' if any relevant content exists."},
@@ -982,9 +1015,7 @@ with tab2:
 
                 st.session_state.last_retrieved_docs = last_snips
                 st.session_state.last_context_blocks = context_blocks
-                st.session_state.last_question = user_question
-                st.session_state.last_answer = answer
-                st.session_state.last_figure_ref = fig_ref or st.session_state.last_figure_ref
+                st.session_state.last_ref = ref or st.session_state.last_ref
 
                 st.rerun()
 
