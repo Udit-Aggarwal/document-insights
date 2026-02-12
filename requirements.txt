@@ -9,3 +9,5 @@ langchain-text-splitters
 langchain-core
 langchain-huggingface
 openai
+langchain-qdrant
+qdrant-client
