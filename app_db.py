@@ -1,27 +1,16 @@
 # app.py
 """
-Complete unified app:
-- Upload PDF/TXT
-- Process document -> chunk + embed + store KB (Qdrant or FAISS fallback)
-- Summary tab (restored)
-- Q&A tab with SQLite chat memory
-- Text LLM routing: HF Router -> Groq primary, Groq direct fallback
-
-Vision enhancements (HF token):
-- deepseek-ai/DeepSeek-OCR-2: OCR/table extraction/markdown conversion prompts like "<|grounding|>Convert the document to markdown." [1](https://www.mongodb.com/docs/atlas/atlas-vector-search/create-embeddings/)[2](https://stackoverflow.com/questions/74721623/how-do-you-use-pymongo-to-connect-to-mongodb-atlas)
-- llava-hf/llava-v1.6-34b-hf: explanation / visual reasoning; model expects image + prompt. [3](https://github.com/groq/groq-python)
-
-Robust fixes:
-1) Table 3 vs Table 9 bug:
-   - runtime fallback triggers only if the requested table number is missing (not just "some table exists").
-   - locate table pages using page-wise PDF text search first; then OCR those pages.
-2) References:
-   - stop S1/S2 in answers
-   - ask model to cite (Page X)
-   - show sources used in sidebar with page preview and PDF download
-3) Completeness:
-   - continuation pass for vision outputs if truncated
-   - larger token slider for text LLM
+COMPLETE FIXED UNIFIED APP:
+- Keeps original requirements: Upload -> Process -> Summary + Q&A, Qdrant KB + FAISS fallback,
+  HF Router->Groq primary + Groq fallback, SQLite chat history.
+- Uses BOTH:
+   deepseek-ai/DeepSeek-OCR-2 for OCR / markdown table extraction. [1](https://www.mongodb.com/docs/atlas/atlas-vector-search/create-embeddings/)[2](https://stackoverflow.com/questions/74721623/how-do-you-use-pymongo-to-connect-to-mongodb-atlas)
+   llava-hf/llava-v1.6-34b-hf for explanations/insights. [3](https://github.com/groq/groq-python)
+- Fixes:
+   (A) Table 3 not triggering runtime extraction even when Table 9 exists.
+   (B) Queries returning "Not found" when KB not processed.
+   (C) Removes S1/S2; uses page citations and shows sources in sidebar.
+- Image payload compression to reduce HF 413 errors. [4](https://www.apideck.com/blog/how-to-get-your-groq-api-key)
 """
 
 import os
@@ -39,7 +28,6 @@ from typing import Optional, Tuple, List, Dict, Any
 import streamlit as st
 import fitz  # PyMuPDF
 from PIL import Image
-
 from openai import OpenAI
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -49,19 +37,18 @@ from langchain_community.vectorstores import FAISS
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
-from qdrant_client.http import models as qmodels
 
 
-# =========================
+# -----------------------------
 # Page config
-# =========================
+# -----------------------------
 st.set_page_config(page_title="Document Summarization & Q&A", layout="wide")
 st.title("📄 Document Summarization & Q&A (DeepSeek OCR2 + LLaVA + Groq routing)")
 
 
-# =========================
+# -----------------------------
 # Local FAISS persistence (fallback KB)
-# =========================
+# -----------------------------
 FAISS_DIR = Path("faiss_store")
 FAISS_DIR.mkdir(exist_ok=True)
 
@@ -74,9 +61,9 @@ def load_faiss(embeddings, path: Path = FAISS_DIR) -> Optional[FAISS]:
     return None
 
 
-# =========================
+# -----------------------------
 # SQLite chat history persistence
-# =========================
+# -----------------------------
 CHAT_DB_PATH = "chat_history.sqlite"
 
 def init_chat_db():
@@ -120,49 +107,53 @@ def clear_history(session_id: str):
     con.close()
 
 
-# =========================
+# -----------------------------
 # Session state
-# =========================
+# -----------------------------
 if "vectorstore" not in st.session_state:
     st.session_state.vectorstore = None
 if "kb_ready" not in st.session_state:
     st.session_state.kb_ready = False
+if "doc_processed" not in st.session_state:
+    st.session_state.doc_processed = False
 
 if "text" not in st.session_state:
     st.session_state.text = ""
 if "chunks" not in st.session_state:
     st.session_state.chunks = []
+
+# page-wise text for locating Table N pages
 if "page_texts" not in st.session_state:
     st.session_state.page_texts = []  # list of {"page": int, "text": str}
-if "debug_raw" not in st.session_state:
-    st.session_state.debug_raw = False
 
-# chat
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-if "last_retrieved_docs" not in st.session_state:
-    st.session_state.last_retrieved_docs = []
-if "last_sources" not in st.session_state:
-    st.session_state.last_sources = []  # list of dicts: {page, filename, chunk_type, preview}
-if "session_id" not in st.session_state:
-    st.session_state.session_id = str(uuid.uuid4())
-
-# store pdf bytes for runtime fallback + page preview
+# pdf bytes for runtime extraction + previews
 if "last_pdf_bytes" not in st.session_state:
     st.session_state.last_pdf_bytes = None
 if "last_pdf_name" not in st.session_state:
     st.session_state.last_pdf_name = None
 
+# chat + sources
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "last_sources" not in st.session_state:
+    st.session_state.last_sources = []  # list of {"filename","page","chunk_type","preview"}
+
+if "debug_raw" not in st.session_state:
+    st.session_state.debug_raw = False
+
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
 SESSION_ID = st.session_state.session_id
+
 init_chat_db()
 if "history_synced" not in st.session_state:
     st.session_state.chat_history = load_history(SESSION_ID)
     st.session_state.history_synced = True
 
 
-# =========================
+# -----------------------------
 # Helpers
-# =========================
+# -----------------------------
 def get_secret(name: str, default=None):
     return os.getenv(name) or st.secrets.get(name, default)
 
@@ -170,9 +161,9 @@ def normalize_text(s: str) -> str:
     return (s or "").strip()
 
 
-# =========================
-# Text LLM routing (HF Router -> Groq primary, Groq direct fallback)
-# =========================
+# -----------------------------
+# Text LLM routing: HF Router -> Groq primary, Groq fallback
+# -----------------------------
 def hf_routed_model(model_id: str) -> str:
     return model_id if ":" in model_id else f"{model_id}:groq"
 
@@ -183,13 +174,11 @@ def openai_chat(client: OpenAI, model: str, messages, temperature: float, max_to
     content = resp.choices[0].message.content if resp and resp.choices else ""
     return content, resp
 
-def llm_chat_with_fallback(
-    model_id: str, messages, temperature: float, max_tokens: int,
-    hf_token: Optional[str], groq_key: Optional[str], debug: bool = False
-):
-    result = {"content": "", "primary_used": False, "raw": None, "error_primary": None, "error_fallback": None}
+def llm_chat_with_fallback(model_id: str, messages, temperature: float, max_tokens: int,
+                           hf_token: Optional[str], groq_key: Optional[str], debug: bool = False):
+    result = {"content": "", "primary_used": False, "raw": None,
+              "error_primary": None, "error_fallback": None}
 
-    # Primary: HF Router -> Groq provider
     if hf_token:
         try:
             hf_client = OpenAI(base_url="https://router.huggingface.co/v1", api_key=hf_token)
@@ -206,7 +195,6 @@ def llm_chat_with_fallback(
     else:
         result["error_primary"] = "Missing HUGGINGFACE_API_TOKEN"
 
-    # Fallback: Groq direct
     if not groq_key:
         result["error_fallback"] = "Missing GROQ_API_KEY (fallback not available)"
         return result
@@ -223,15 +211,17 @@ def llm_chat_with_fallback(
         return result
 
 
-# =========================
-# HF vision calls (DeepSeek OCR2 + LLaVA) with compression + continuation
-# =========================
+# -----------------------------
+# HF vision calls: DeepSeek OCR2 + LLaVA with compression + continuation
+# -----------------------------
 HF_INFER_BASE = "https://api-inference.huggingface.co/v1/"
 DEEPSEEK_OCR_MODEL = "deepseek-ai/DeepSeek-OCR-2"  # [1](https://www.mongodb.com/docs/atlas/atlas-vector-search/create-embeddings/)[2](https://stackoverflow.com/questions/74721623/how-do-you-use-pymongo-to-connect-to-mongodb-atlas)
 LLAVA_MODEL = "llava-hf/llava-v1.6-34b-hf"        # [3](https://github.com/groq/groq-python)
 
 def image_to_data_url(img: Image.Image, max_bytes: int = 650_000) -> str:
-    """Compress + downscale to reduce 413 Payload Too Large risk. [4](https://www.apideck.com/blog/how-to-get-your-groq-api-key)"""
+    """
+    Compress + downscale to reduce HF 413 Payload Too Large risk. [4](https://www.apideck.com/blog/how-to-get-your-groq-api-key)
+    """
     img = img.convert("RGB")
     max_side = 1300
     w, h = img.size
@@ -255,7 +245,6 @@ def image_to_data_url(img: Image.Image, max_bytes: int = 650_000) -> str:
 
 def hf_vision_chat(hf_token: str, model: str, img: Image.Image, prompt: str,
                    max_tokens: int = 1200, retries: int = 2) -> str:
-    """HF Inference OpenAI-compatible call with image_url + text blocks."""
     if not hf_token:
         return ""
     data_url = image_to_data_url(img)
@@ -299,17 +288,16 @@ def hf_vision_chat_with_continue(hf_token: str, model: str, img: Image.Image, pr
                                  max_tokens: int = 1200) -> str:
     out1 = hf_vision_chat(hf_token, model, img, prompt, max_tokens=max_tokens, retries=2)
     if looks_truncated(out1):
-        out2 = hf_vision_chat(hf_token, model, img,
-                              prompt + "\n\nContinue from where you left off. Do not repeat.",
+        out2 = hf_vision_chat(hf_token, model, img, prompt + "\n\nContinue from where you left off. Do not repeat.",
                               max_tokens=max_tokens, retries=2)
         if out2 and out2 not in out1:
             return (out1 + "\n" + out2).strip()
     return out1
 
 
-# =========================
-# Parse references (table/figure/page) + BUGFIX: ensure runtime triggers only if requested number missing
-# =========================
+# -----------------------------
+# Parse table/figure/page
+# -----------------------------
 TABLE_REF_RE = re.compile(r"\b(?:table|tab\.?)\s*(\d+)\b", re.IGNORECASE)
 FIGURE_REF_RE = re.compile(r"\b(?:figure|fig\.?)\s*(\d+)\b", re.IGNORECASE)
 PAGE_REF_RE  = re.compile(r"\bpage\s*(\d+)\b", re.IGNORECASE)
@@ -326,26 +314,11 @@ def parse_page_number(q: str) -> Optional[int]:
     m = PAGE_REF_RE.search(q or "")
     return int(m.group(1)) if m else None
 
-def is_visual_question(q: str) -> bool:
-    return bool(re.search(r"\b(table|tab|figure|fig|diagram|chart|graph|image)\b", q or "", flags=re.I))
 
-def table_pat(n: int):
-    return re.compile(rf"\b(tab(?:le)?\.?)\s*{n}\b", re.IGNORECASE)
-
-def figure_pat(n: int):
-    return re.compile(rf"\b(fig(?:ure)?\.?)\s*{n}\b", re.IGNORECASE)
-
-def has_specific_table_in_text(text: str, table_n: int) -> bool:
-    return bool(table_pat(table_n).search(text or ""))
-
-def has_specific_figure_in_text(text: str, fig_n: int) -> bool:
-    return bool(figure_pat(fig_n).search(text or ""))
-
-
-# =========================
-# PDF page rendering (for runtime extraction + sidebar preview)
-# =========================
-def render_pdf_page(pdf_bytes: bytes, page_num_1based: int, dpi: int = 200) -> Optional[Image.Image]:
+# -----------------------------
+# Render PDF page (for sidebar preview + runtime)
+# -----------------------------
+def render_pdf_page(pdf_bytes: bytes, page_num_1based: int, dpi: int = 160) -> Optional[Image.Image]:
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         idx = page_num_1based - 1
@@ -361,9 +334,9 @@ def render_pdf_page(pdf_bytes: bytes, page_num_1based: int, dpi: int = 200) -> O
         return None
 
 
-# =========================
+# -----------------------------
 # KB init: Qdrant + FAISS fallback
-# =========================
+# -----------------------------
 EMBEDDINGS = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 EMBED_DIM = 384
 
@@ -371,10 +344,8 @@ def init_qdrant_vectorstore() -> Tuple[Optional[QdrantVectorStore], Optional[str
     url = get_secret("QDRANT_URL", None)
     api_key = get_secret("QDRANT_API_KEY", None)
     collection_name = get_secret("QDRANT_COLLECTION", "doc_kb")
-
     if not url or not api_key:
         return None, "Missing QDRANT_URL or QDRANT_API_KEY"
-
     try:
         client = QdrantClient(url=url, api_key=api_key)
         try:
@@ -420,28 +391,9 @@ def ensure_vectorstore(kb_backend: str):
             st.session_state.kb_ready = True
 
 
-# =========================
-# Retrieval helpers + source collection (no S1/S2)
-# =========================
-VISUAL_TYPES = {"table_runtime", "figure_runtime", "page_ocr", "main_text"}
-
-def qdrant_filter_for_chunk_types(types: List[str]) -> Optional[qmodels.Filter]:
-    should = []
-    for path in ["metadata.chunk_type", "chunk_type"]:
-        should.append(qmodels.FieldCondition(key=path, match=qmodels.MatchAny(any=types)))
-    return qmodels.Filter(should=should)
-
-def retrieve_docs(vectorstore, query: str, k: int) -> List[Any]:
-    # simplest: use similarity_search
-    try:
-        return vectorstore.similarity_search(query, k=k)
-    except Exception:
-        return []
-
-
-# =========================
-# Summary helper (restored)
-# =========================
+# -----------------------------
+# Summary helper
+# -----------------------------
 def build_summary_prompt(text: str) -> list[dict]:
     return [
         {"role": "system", "content": "Summarize faithfully and avoid adding facts. Return 8-12 bullet points."},
@@ -449,25 +401,27 @@ def build_summary_prompt(text: str) -> list[dict]:
     ]
 
 
-# =========================
-# Runtime extractors (dual model)
-# =========================
-def runtime_extract_table_md(hf_token: str, img: Image.Image, table_n: int) -> str:
+# -----------------------------
+# Runtime table extraction (robust Table 3 fix)
+# -----------------------------
+def deepseek_extract_table_md(hf_token: str, img: Image.Image, table_n: int) -> str:
+    # DeepSeek OCR2 conversion prompt style [1](https://www.mongodb.com/docs/atlas/atlas-vector-search/create-embeddings/)[2](https://stackoverflow.com/questions/74721623/how-do-you-use-pymongo-to-connect-to-mongodb-atlas)
     prompt = f"<image>\n<|grounding|>Convert the document to markdown.\nFocus on Table {table_n}."
     return hf_vision_chat_with_continue(hf_token, DEEPSEEK_OCR_MODEL, img, prompt, max_tokens=1800)
 
-def runtime_explain_table(hf_token: str, img: Image.Image, table_md: str, table_n: int) -> str:
+def llava_explain_table(hf_token: str, img: Image.Image, table_md: str, table_n: int) -> str:
+    # LLaVA explanation grounded on extracted markdown [3](https://github.com/groq/groq-python)
     prompt = (
-        f"This image contains Table {table_n}. Explain the table in detail.\n"
-        "Use the extracted markdown table below as grounding:\n\n"
+        f"This image contains Table {table_n}. Explain the table.\n"
+        "Use the extracted table text below as grounding:\n\n"
         f"{table_md}\n\n"
-        "Explain: columns meaning, key values, comparisons, patterns, and takeaway."
+        "Explain columns, key values, patterns, comparisons, and takeaway."
     )
     return hf_vision_chat_with_continue(hf_token, LLAVA_MODEL, img, prompt, max_tokens=1200)
 
 
 # =========================
-# Sidebar controls + Sources panel
+# Sidebar (KB + controls + sources)
 # =========================
 st.sidebar.header("KB Backend")
 kb_backend = st.sidebar.selectbox("Knowledge Base storage", ["Qdrant Cloud (API key)", "FAISS (Local fallback)"], index=0)
@@ -490,9 +444,6 @@ st.sidebar.header("Chat Memory")
 max_history_turns = st.sidebar.slider("Max chat turns kept", 2, 20, 8, 1)
 if st.sidebar.button("🧹 Clear chat history"):
     st.session_state.chat_history = []
-    st.session_state.last_retrieved_docs = []
-    st.session_state.last_context_blocks = []
-    st.session_state.last_ref = None
     st.session_state.last_sources = []
     clear_history(SESSION_ID)
     st.toast("Chat history cleared.", icon="🧹")
@@ -502,6 +453,7 @@ st.sidebar.subheader("Sources (last answer)")
 if st.session_state.last_sources:
     for i, src in enumerate(st.session_state.last_sources, start=1):
         with st.sidebar.expander(f"{i}. {src.get('filename','document')} — Page {src.get('page','?')}"):
+            st.caption(src.get("chunk_type", ""))
             st.write(src.get("preview", ""))
             if st.session_state.last_pdf_bytes and src.get("page"):
                 img = render_pdf_page(st.session_state.last_pdf_bytes, int(src["page"]), dpi=160)
@@ -538,7 +490,7 @@ ensure_vectorstore(kb_backend)
 
 
 # =========================
-# Upload + Process Document (page-aware chunking)
+# Upload + Process Document (IMPORTANT: must be clicked)
 # =========================
 uploaded_file = st.file_uploader("Upload Document (PDF or TXT)", type=["pdf", "txt"])
 
@@ -551,21 +503,23 @@ if uploaded_file:
 
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
             page_texts = []
-            full_text_parts = []
+            full_text = []
             for i in range(doc.page_count):
                 page = doc.load_page(i)
                 t = page.get_text("text") or ""
                 page_texts.append({"page": i + 1, "text": t})
-                full_text_parts.append(f"[PAGE {i+1}]\n{t}")
+                full_text.append(f"[PAGE {i+1}]\n{t}")
             doc.close()
 
             st.session_state.page_texts = page_texts
-            st.session_state.text = "\n\n".join(full_text_parts).strip()
+            st.session_state.text = "\n\n".join(full_text).strip()
+            st.session_state.doc_processed = False
         else:
             st.session_state.text = uploaded_file.read().decode("utf-8", errors="replace")
             st.session_state.page_texts = []
             st.session_state.last_pdf_bytes = None
             st.session_state.last_pdf_name = None
+            st.session_state.doc_processed = False
 
         st.success(f"Document loaded: {len(st.session_state.text)} characters")
     except Exception as e:
@@ -590,22 +544,21 @@ if st.button("Process Document") and st.session_state.text:
             }
 
             if st.session_state.page_texts:
-                # PAGE-AWARE chunking: preserve page numbers for references
                 for item in st.session_state.page_texts:
                     p = int(item["page"])
                     txt = item["text"] or ""
                     if not txt.strip():
                         continue
-                    chunks = splitter.split_text(txt)
-                    for ch in chunks:
+                    pieces = splitter.split_text(txt)
+                    for ch in pieces:
                         all_chunks.append(ch)
                         m = dict(meta_base)
                         m["chunk_type"] = "main_text"
                         m["page"] = p
                         all_metas.append(m)
             else:
-                chunks = splitter.split_text(st.session_state.text)
-                for ch in chunks:
+                pieces = splitter.split_text(st.session_state.text)
+                for ch in pieces:
                     all_chunks.append(ch)
                     m = dict(meta_base)
                     m["chunk_type"] = "main_text"
@@ -615,16 +568,17 @@ if st.button("Process Document") and st.session_state.text:
             st.session_state.chunks = all_chunks
 
             if st.session_state.vectorstore is None:
-                st.session_state.vectorstore = FAISS.from_texts(all_chunks, EMBEDDINGS, metadatas=all_metas)
+                st.session_state.vectorstore = FAISS.from_texts(all_chunks, HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2"), metadatas=all_metas)
                 save_faiss(st.session_state.vectorstore)
                 st.session_state.kb_ready = True
-                st.success(f"Stored {len(all_chunks)} chunks in FAISS KB.")
             else:
                 st.session_state.vectorstore.add_texts(all_chunks, metadatas=all_metas)
                 if isinstance(st.session_state.vectorstore, FAISS):
                     save_faiss(st.session_state.vectorstore)
                 st.session_state.kb_ready = True
-                st.success(f"Stored {len(all_chunks)} chunks in KB.")
+
+            st.session_state.doc_processed = True
+            st.success(f"Stored {len(all_chunks)} chunks in KB.")
         except Exception as e:
             st.error(f"Processing failed: {e}")
             st.exception(e)
@@ -637,7 +591,7 @@ tab1, tab2 = st.tabs(["📝 Summary", "💬 Q&A (Chat)"])
 
 
 # =========================
-# Summary Tab (restored)
+# Summary Tab
 # =========================
 with tab1:
     st.markdown("**Generate a summary of the uploaded document.**")
@@ -649,75 +603,38 @@ with tab1:
             st.warning("Upload a document first.")
         else:
             with st.spinner("Summarizing..."):
-                if use_chunked_summary:
-                    if not st.session_state.chunks:
-                        st.warning("Click 'Process Document' first for best results (or enable processing).")
-                    n = min(12, len(st.session_state.chunks)) if st.session_state.chunks else 0
-                    if n == 0:
-                        text_in = st.session_state.text[: int(max_input_chars)]
-                        result = llm_chat_with_fallback(
-                            model_id=model_id,
-                            messages=build_summary_prompt(text_in),
-                            temperature=temperature,
-                            max_tokens=min(max_tokens, 1024),
-                            hf_token=hf_token,
-                            groq_key=groq_key,
-                            debug=st.session_state.debug_raw
-                        )
-                        st.write(result["content"] or "No summary returned.")
-                    else:
-                        mini = []
-                        for i in range(n):
-                            msgs = [
-                                {"role": "system", "content": "Summarize in 2-3 bullet points. Avoid adding facts."},
-                                {"role": "user", "content": st.session_state.chunks[i]},
-                            ]
-                            out = llm_chat_with_fallback(
-                                model_id=model_id, messages=msgs,
-                                temperature=temperature, max_tokens=256,
-                                hf_token=hf_token, groq_key=groq_key,
-                                debug=st.session_state.debug_raw
-                            )
-                            mini.append(out["content"] or "")
-
-                        final_msgs = [
-                            {"role": "system", "content": "Combine into 8-12 bullet executive summary. No extra facts."},
-                            {"role": "user", "content": "\n\n".join(mini)},
-                        ]
-                        result = llm_chat_with_fallback(
-                            model_id=model_id, messages=final_msgs,
-                            temperature=temperature, max_tokens=min(max_tokens, 1200),
-                            hf_token=hf_token, groq_key=groq_key,
-                            debug=st.session_state.debug_raw
-                        )
-                        st.write(result["content"] or "No summary returned.")
-                else:
-                    text_in = st.session_state.text[: int(max_input_chars)]
-                    result = llm_chat_with_fallback(
-                        model_id=model_id,
-                        messages=build_summary_prompt(text_in),
-                        temperature=temperature,
-                        max_tokens=min(max_tokens, 1200),
-                        hf_token=hf_token,
-                        groq_key=groq_key,
-                        debug=st.session_state.debug_raw
-                    )
-                    st.write(result["content"] or "No summary returned.")
+                text_in = st.session_state.text[: int(max_input_chars)]
+                result = llm_chat_with_fallback(
+                    model_id=model_id,
+                    messages=build_summary_prompt(text_in),
+                    temperature=temperature,
+                    max_tokens=min(max_tokens, 1200),
+                    hf_token=hf_token,
+                    groq_key=groq_key,
+                    debug=st.session_state.debug_raw
+                )
+                st.write(result["content"] or "No summary returned.")
 
 
 # =========================
-# Q&A Tab (fix Table 3 + references + UI sources)
+# Q&A Tab (robust: always answers + page citations + sources)
 # =========================
 with tab2:
-    st.markdown("**Ask about your document. Tip: “Explain Table 3 on page 7” is deterministic.**")
+    st.markdown("**Ask about your document. For best table accuracy use: “Explain Table 3 on page 7”.**")
 
-    # Render chat history
     for msg in st.session_state.chat_history:
         with st.chat_message("user" if msg["role"] == "user" else "assistant"):
             st.write(msg["content"])
 
     user_question = st.chat_input("Ask a question…")
     if user_question:
+        # If KB not processed, stop returning empty answers
+        if not st.session_state.doc_processed:
+            warn = "⚠️ Please click **Process Document** first. The KB is not indexed yet, so retrieval will be empty."
+            st.session_state.chat_history.append({"role": "assistant", "content": warn})
+            append_message(SESSION_ID, "assistant", warn)
+            st.rerun()
+
         st.session_state.chat_history.append({"role": "user", "content": user_question})
         append_message(SESSION_ID, "user", user_question)
 
@@ -729,17 +646,18 @@ with tab2:
             st.rerun()
 
         table_n = parse_table_number(user_question)
-        fig_n = parse_figure_number(user_question)
         page_n = parse_page_number(user_question)
-        prefer_visual = is_visual_question(user_question)
 
-        # Retrieve
-        k = max(int(top_k), 10) if prefer_visual else int(top_k)
-        docs = retrieve_docs(st.session_state.vectorstore, user_question, k=k)
+        # Retrieve docs
+        docs = []
+        try:
+            docs = st.session_state.vectorstore.similarity_search(user_question, k=int(top_k))
+        except Exception:
+            docs = []
 
-        # Build sources (metadata-based) and context (no S1/S2 in answer)
-        sources = []
+        # Build context lines with page headers (for page citations)
         context_lines = []
+        sources = []
         for d in docs:
             txt = getattr(d, "page_content", "") or ""
             md = getattr(d, "metadata", {}) or {}
@@ -748,66 +666,57 @@ with tab2:
             chunk_type = md.get("chunk_type", "main_text")
             preview = (txt.strip().replace("\n", " ")[:280] + ("…" if len(txt) > 280 else ""))
 
-            sources.append({
-                "filename": filename,
-                "page": page,
-                "chunk_type": chunk_type,
-                "preview": preview
-            })
+            sources.append({"filename": filename, "page": page, "chunk_type": chunk_type, "preview": preview})
 
-            # Embed page reference into the context for the model
-            # so it can cite (Page X) instead of S1/S2.
             page_tag = f"Page {page}" if page else "Page ?"
-            context_lines.append(f"[{page_tag} | {filename} | {chunk_type}]\n{txt}")
+            context_lines.append(f"[{page_tag} | {filename}]\n{txt}")
 
-        # Reset sidebar sources for this answer
         st.session_state.last_sources = sources[:8]
 
-        # ---- Robust runtime fallback for Table N (fix persistent Table 3) ----
+        # ---- Table runtime fallback (THIS fixes Table 3 persisting) ----
         runtime_answer = None
         if table_n is not None and st.session_state.last_pdf_bytes and hf_token:
-            # if Table N not present in retrieved context, run runtime extraction
-            combined_context_text = "\n".join(context_lines)
-            table_present = has_specific_table_in_text(combined_context_text, table_n)
-
-            if not table_present:
-                # 1) find candidate pages from page-wise text first (most reliable)
+            combined = "\n".join(context_lines)
+            # If retrieved snippets don't mention *Table N*, force runtime extraction
+            if not has_specific_table_in_text(combined, table_n):
+                # candidate pages:
                 candidate_pages = []
+                # (1) page-wise text first
                 for item in st.session_state.page_texts:
                     if has_specific_table_in_text(item.get("text", ""), table_n):
                         candidate_pages.append(int(item["page"]))
 
-                # if user specified page, prioritize it
+                # If user gave page number, prioritize
                 if page_n is not None:
                     candidate_pages = [int(page_n)] + [p for p in candidate_pages if p != int(page_n)]
 
-                # fallback: if no candidates, scan first 25 pages
+                # If still none, try first 30 pages (caption might be image; so text search fails)
                 if not candidate_pages:
                     try:
                         doc = fitz.open(stream=st.session_state.last_pdf_bytes, filetype="pdf")
-                        limit = min(25, doc.page_count)
+                        limit = min(30, doc.page_count)
                         doc.close()
                     except Exception:
-                        limit = 25
+                        limit = 30
                     candidate_pages = list(range(1, limit + 1))
 
                 best_page = None
                 best_md = ""
-                for p in candidate_pages[:12]:  # cap attempts
+                # Try a limited number of candidate pages
+                for p in candidate_pages[:15]:
                     img = render_pdf_page(st.session_state.last_pdf_bytes, p, dpi=300)
                     if img is None:
                         continue
-                    md = runtime_extract_table_md(hf_token, img, table_n)
-                    # accept if it looks like a table markdown or mentions Table n
-                    if md and ("|" in md or has_specific_table_in_text(md, table_n)):
+                    md = deepseek_extract_table_md(hf_token, img, table_n)
+                    # accept if it looks like a table (markdown pipes) or mentions Table N
+                    if md and ("|" in md or f"Table {table_n}" in md or f"TABLE {table_n}" in md):
                         best_page = p
                         best_md = md
                         break
 
                 if best_page is not None:
                     img = render_pdf_page(st.session_state.last_pdf_bytes, best_page, dpi=300)
-                    expl = runtime_explain_table(hf_token, img, best_md, table_n)
-
+                    expl = llava_explain_table(hf_token, img, best_md, table_n)
                     runtime_answer = (
                         f"### ✅ Table {table_n} (Page {best_page})\n\n"
                         f"#### Extracted (DeepSeek OCR‑2)\n{best_md}\n\n"
@@ -815,7 +724,7 @@ with tab2:
                         f"**Source:** {st.session_state.last_pdf_name or 'document'} (Page {best_page})"
                     )
 
-                    # store runtime into KB so future retrieval works
+                    # Store runtime chunk into KB
                     try:
                         runtime_chunk = f"[TABLE_RUNTIME][TABLE {table_n}][PAGE {best_page}] {runtime_answer}"
                         meta = {
@@ -833,33 +742,37 @@ with tab2:
                     except Exception:
                         pass
 
-        # If runtime answer exists, return it directly (avoids S1/S2 + avoids partial answers)
+                    # update sidebar sources to show correct page
+                    st.session_state.last_sources = [{
+                        "filename": st.session_state.last_pdf_name or "document",
+                        "page": best_page,
+                        "chunk_type": "table_runtime",
+                        "preview": "Runtime extracted Table content + explanation."
+                    }]
+
+        # If runtime succeeded, return it directly (prevents empty answers)
         if runtime_answer:
             st.session_state.chat_history.append({"role": "assistant", "content": runtime_answer})
             append_message(SESSION_ID, "assistant", runtime_answer)
-
-            # update sidebar sources to the correct page
-            st.session_state.last_sources = [{
-                "filename": st.session_state.last_pdf_name or "document",
-                "page": int(re.search(r"Page (\d+)", runtime_answer).group(1)) if re.search(r"Page (\d+)", runtime_answer) else None,
-                "chunk_type": "table_runtime",
-                "preview": "Runtime extracted Table content + explanation."
-            }]
             st.rerun()
 
-        # Otherwise: normal grounded answer, but request page citations not S1/S2
+        # If no docs returned, make it explicit and actionable
+        if not context_lines:
+            answer = "Not found in the document excerpts. Try increasing Top K or ask with page number (e.g., 'Table 3 on page 7')."
+            st.session_state.chat_history.append({"role": "assistant", "content": answer})
+            append_message(SESSION_ID, "assistant", answer)
+            st.rerun()
+
+        # Normal grounded answer WITHOUT S1/S2: cite (Page X)
         system = (
-            "You are a precise assistant. Use ONLY the provided document excerpts.\n"
-            "When you use information, cite it as (Page X) using the page mentioned in the excerpt header.\n"
+            "You are a precise assistant. Use ONLY the provided excerpts.\n"
+            "When you use information, cite it as (Page X) using the page shown in excerpt headers.\n"
             "Do NOT cite S1/S2. Do NOT invent page numbers.\n"
-            "If the answer is not present, say: 'Not found in the document excerpts.'"
+            "If not present, say: 'Not found in the document excerpts.'"
         )
         user = f"Document excerpts:\n\n{'\n\n'.join(context_lines)}\n\nQuestion: {user_question}\nAnswer:"
 
-        msgs = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ]
+        msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         result = llm_chat_with_fallback(
             model_id=model_id,
             messages=msgs,
