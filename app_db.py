@@ -39,6 +39,7 @@ CHAT_DB_PATH = "chat_history.sqlite"
 FAISS_DIR = Path("faiss_store")
 FAISS_DIR.mkdir(exist_ok=True)
 
+
 # =========================================================
 # STREAMLIT PAGE
 # =========================================================
@@ -47,25 +48,36 @@ st.title(APP_TITLE)
 
 
 # =========================================================
-# HELPERS: secrets/env
+# Helpers: env/secrets
 # =========================================================
 def get_secret(name: str, default=None):
     return os.getenv(name) or st.secrets.get(name, default)
 
+def normalize_text(s: str) -> str:
+    return (s or "").strip()
+
+def looks_truncated(s: str) -> bool:
+    if not s:
+        return False
+    tail = s.strip()[-40:]
+    if tail.endswith("...") or tail.endswith(".."):
+        return True
+    if re.search(r"[A-Za-z0-9]$", tail) and not re.search(r"[.!?]\s*$", tail):
+        return True
+    return False
+
 
 # =========================================================
-# HELPERS: caching + UI hard reload
-# (Mitigation for Streamlit frontend hashed chunk cache mismatches)
+# UI: Cache-bust reload (mitigates Streamlit hashed JS cache mismatch after deploy)
 # =========================================================
 with st.sidebar:
     if st.button("🔄 Hard Reload (Cache Bust)"):
-        # Change query string to force a “fresh navigation” in most browsers.
         st.query_params["v"] = str(int(time.time()))
         st.rerun()
 
 
 # =========================================================
-# SQLITE CHAT MEMORY
+# SQLite chat memory
 # =========================================================
 def init_chat_db():
     con = sqlite3.connect(CHAT_DB_PATH)
@@ -109,7 +121,7 @@ def clear_history(session_id: str):
 
 
 # =========================================================
-# SESSION STATE DEFAULTS
+# Session state
 # =========================================================
 def ss_init(key, default):
     if key not in st.session_state:
@@ -119,18 +131,22 @@ ss_init("session_id", str(uuid.uuid4()))
 SESSION_ID = st.session_state.session_id
 
 ss_init("vectorstore", None)
-ss_init("kb_ready", False)
-ss_init("doc_processed", False)
+ss_init("kb_backend", "Qdrant Cloud (API key)")
+
+# The robust "indexed marker" (fixes your persistent issue)
+ss_init("indexed_doc_id", None)
+ss_init("indexed_chunks_count", 0)
 
 ss_init("text", "")
-ss_init("page_texts", [])  # [{"page": int, "text": str}]
+ss_init("page_texts", [])
 ss_init("chunks", [])
 
 ss_init("last_pdf_bytes", None)
 ss_init("last_pdf_name", None)
 
 ss_init("chat_history", [])
-ss_init("last_sources", [])  # [{"filename","page","chunk_type","preview"}]
+ss_init("last_sources", [])
+
 ss_init("debug_raw", False)
 
 init_chat_db()
@@ -140,7 +156,7 @@ if "history_synced" not in st.session_state:
 
 
 # =========================================================
-# VECTORSTORE: FAISS helpers
+# Vectorstore helpers
 # =========================================================
 def save_faiss(vectorstore: FAISS, path: Path = FAISS_DIR):
     vectorstore.save_local(str(path))
@@ -152,17 +168,17 @@ def load_faiss(embeddings, path: Path = FAISS_DIR) -> Optional[FAISS]:
 
 
 # =========================================================
-# QDRANT INIT
+# Qdrant init
 # =========================================================
 EMBEDDINGS = HuggingFaceEmbeddings(model_name=EMBED_MODEL_NAME)
 
-def init_qdrant_vectorstore() -> Tuple[Optional[QdrantVectorStore], Optional[str], Optional[QdrantClient], str]:
+def init_qdrant_vectorstore() -> Tuple[Optional[QdrantVectorStore], Optional[str]]:
     url = get_secret("QDRANT_URL", None)
     api_key = get_secret("QDRANT_API_KEY", None)
     collection_name = get_secret("QDRANT_COLLECTION", "doc_kb")
 
     if not url or not api_key:
-        return None, "Missing QDRANT_URL or QDRANT_API_KEY", None, collection_name
+        return None, "Missing QDRANT_URL or QDRANT_API_KEY"
 
     try:
         client = QdrantClient(url=url, api_key=api_key)
@@ -173,74 +189,31 @@ def init_qdrant_vectorstore() -> Tuple[Optional[QdrantVectorStore], Optional[str
                 collection_name=collection_name,
                 vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
             )
-
         vs = QdrantVectorStore(client=client, collection_name=collection_name, embedding=EMBEDDINGS)
-        return vs, None, client, collection_name
+        return vs, None
     except Exception as e:
-        return None, f"{type(e).__name__}: {e}", None, collection_name
+        return None, f"{type(e).__name__}: {e}"
 
 
 def ensure_vectorstore(kb_backend: str):
     if kb_backend.startswith("Qdrant"):
-        vs, err, qc, coll = init_qdrant_vectorstore()
+        vs, err = init_qdrant_vectorstore()
         if err:
             st.warning(f"Qdrant not available: {err}. Falling back to FAISS.")
             local = load_faiss(EMBEDDINGS)
             st.session_state.vectorstore = local
-            st.session_state.kb_ready = local is not None
-            st.session_state._qdrant_client = None
-            st.session_state._qdrant_collection = None
         else:
             st.session_state.vectorstore = vs
-            st.session_state.kb_ready = True
-            st.session_state._qdrant_client = qc
-            st.session_state._qdrant_collection = coll
     else:
         local = load_faiss(EMBEDDINGS)
         st.session_state.vectorstore = local
-        st.session_state.kb_ready = local is not None
-        st.session_state._qdrant_client = None
-        st.session_state._qdrant_collection = None
-
-
-def kb_count_hint() -> int:
-    """Best-effort count; prevents 'not found for everything' when KB is empty."""
-    vs = st.session_state.vectorstore
-    if isinstance(vs, FAISS):
-        try:
-            return int(vs.index.ntotal)
-        except Exception:
-            return 0
-    if isinstance(vs, QdrantVectorStore):
-        qc = st.session_state.get("_qdrant_client")
-        coll = st.session_state.get("_qdrant_collection")
-        if qc and coll:
-            try:
-                res = qc.count(collection_name=coll, exact=False)
-                return int(getattr(res, "count", 0))
-            except Exception:
-                return 0
-    return 0
 
 
 # =========================================================
-# TEXT LLM: HF Router -> Groq + Groq fallback
+# Text LLM: HF Router->Groq primary + Groq fallback
 # =========================================================
 def hf_routed_model(model_id: str) -> str:
     return model_id if ":" in model_id else f"{model_id}:groq"
-
-def normalize_text(s: str) -> str:
-    return (s or "").strip()
-
-def looks_truncated(s: str) -> bool:
-    if not s:
-        return False
-    tail = s.strip()[-40:]
-    if tail.endswith("...") or tail.endswith(".."):
-        return True
-    if re.search(r"[A-Za-z0-9]$", tail) and not re.search(r"[.!?]\s*$", tail):
-        return True
-    return False
 
 def openai_chat(client: OpenAI, model: str, messages, temperature: float, max_tokens: int):
     resp = client.chat.completions.create(
@@ -277,38 +250,34 @@ def llm_chat_with_fallback(model_id: str, messages, temperature: float, max_toke
 
 def llm_chat_with_continue(model_id: str, messages, temperature: float, max_tokens: int,
                            hf_token: Optional[str], groq_key: Optional[str]) -> str:
-    out1 = llm_chat_with_fallback(model_id, messages, temperature, max_tokens, hf_token, groq_key, False)
+    out1 = llm_chat_with_fallback(model_id, messages, temperature, max_tokens, hf_token, groq_key)
     if looks_truncated(out1):
         cont = messages + [{"role": "user", "content": "Continue from where you left off. Do not repeat previous text."}]
-        out2 = llm_chat_with_fallback(model_id, cont, temperature, max_tokens, hf_token, groq_key, False)
+        out2 = llm_chat_with_fallback(model_id, cont, temperature, max_tokens, hf_token, groq_key)
         if out2 and out2 not in out1:
             return (out1 + "\n" + out2).strip()
     return out1
 
 
 # =========================================================
-# HF VISION: DeepSeek OCR2 + LLaVA
+# HF Vision calls (DeepSeek + LLaVA)
 # =========================================================
 def image_to_data_url(img: Image.Image, max_bytes: int = 650_000) -> str:
-    """Compress + downscale to reduce 413 Payload Too Large risk."""
     img = img.convert("RGB")
     max_side = 1300
     w, h = img.size
     scale = min(1.0, max_side / float(max(w, h)))
     if scale < 1.0:
         img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))))
-
     quality = 78
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality, optimize=True)
     data = buf.getvalue()
-
     while len(data) > max_bytes and quality > 30:
         quality -= 10
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=quality, optimize=True)
         data = buf.getvalue()
-
     b64 = base64.b64encode(data).decode("utf-8")
     return f"data:image/jpeg;base64,{b64}"
 
@@ -354,7 +323,7 @@ def hf_vision_chat_with_continue(hf_token: str, model: str, img: Image.Image, pr
 
 
 # =========================================================
-# TABLE DETECTION (table-specific)
+# Parse Table/Page
 # =========================================================
 TABLE_REF_RE = re.compile(r"\b(?:table|tab\.?)\s*(\d+)\b", re.IGNORECASE)
 PAGE_REF_RE = re.compile(r"\bpage\s*(\d+)\b", re.IGNORECASE)
@@ -375,9 +344,9 @@ def contains_specific_table(text: str, n: int) -> bool:
 
 
 # =========================================================
-# PDF PAGE RENDERING
+# PDF Rendering
 # =========================================================
-def render_pdf_page(pdf_bytes: bytes, page_num_1based: int, dpi: int = 200) -> Optional[Image.Image]:
+def render_pdf_page(pdf_bytes: bytes, page_num_1based: int, dpi: int = 220) -> Optional[Image.Image]:
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         idx = page_num_1based - 1
@@ -394,7 +363,7 @@ def render_pdf_page(pdf_bytes: bytes, page_num_1based: int, dpi: int = 200) -> O
 
 
 # =========================================================
-# SUMMARY
+# Summary prompt
 # =========================================================
 def build_summary_prompt(text: str) -> list[dict]:
     return [
@@ -404,10 +373,9 @@ def build_summary_prompt(text: str) -> list[dict]:
 
 
 # =========================================================
-# Runtime extraction for Table N: DeepSeek extract -> LLaVA explain
+# Runtime: extract + explain table
 # =========================================================
 def deepseek_extract_table_md(hf_token: str, img: Image.Image, table_n: int) -> str:
-    # Prompt style for OCR2 markdown conversion
     prompt = f"<image>\n<|grounding|>Convert the document to markdown.\nFocus on Table {table_n}."
     return hf_vision_chat_with_continue(hf_token, DEEPSEEK_OCR_MODEL, img, prompt, max_tokens=1800)
 
@@ -422,7 +390,7 @@ def llava_explain_table(hf_token: str, img: Image.Image, table_md: str, table_n:
 
 
 # =========================================================
-# SIDEBAR CONTROLS + SOURCES
+# Sidebar controls + sources
 # =========================================================
 st.sidebar.header("KB Backend")
 kb_backend = st.sidebar.selectbox("Knowledge Base storage", ["Qdrant Cloud (API key)", "FAISS (Local fallback)"], index=0)
@@ -472,22 +440,25 @@ if st.session_state.last_pdf_bytes and st.session_state.last_pdf_name:
 
 
 # =========================================================
-# TOKENS + INIT KB
+# Tokens + initialize store
 # =========================================================
 hf_token = get_secret("HUGGINGFACE_API_TOKEN", None)
 groq_key = get_secret("GROQ_API_KEY", None)
 
 ensure_vectorstore(kb_backend)
-count_hint = kb_count_hint()
 
 
 # =========================================================
-# UPLOAD + PROCESS (page-aware)
+# Upload + Process document
 # =========================================================
 uploaded_file = st.file_uploader("Upload Document (PDF or TXT)", type=["pdf", "txt"])
 
 if uploaded_file:
     try:
+        # create a stable doc_id for this upload
+        doc_id = f"{uploaded_file.name}:{len(uploaded_file.getvalue())}"
+        st.session_state.current_doc_id = doc_id
+
         if uploaded_file.type == "application/pdf":
             pdf_bytes = uploaded_file.getvalue()
             st.session_state.last_pdf_bytes = pdf_bytes
@@ -505,20 +476,23 @@ if uploaded_file:
 
             st.session_state.page_texts = page_texts
             st.session_state.text = "\n\n".join(full_text_parts).strip()
-            st.session_state.doc_processed = False
         else:
             st.session_state.text = uploaded_file.read().decode("utf-8", errors="replace")
             st.session_state.page_texts = []
             st.session_state.last_pdf_bytes = None
             st.session_state.last_pdf_name = None
-            st.session_state.doc_processed = False
 
         st.success(f"Document loaded: {len(st.session_state.text)} characters")
+        # reset indexed markers for new upload
+        st.session_state.indexed_doc_id = None
+        st.session_state.indexed_chunks_count = 0
+        st.session_state.doc_processed = False
+
     except Exception as e:
         st.error(f"Failed to read uploaded file: {e}")
 
 if st.button("Process Document") and st.session_state.text:
-    with st.spinner("Chunking + embedding + storing in KB (page-aware)..."):
+    with st.spinner("Chunking + embedding + storing in KB..."):
         try:
             splitter = RecursiveCharacterTextSplitter(chunk_size=int(chunk_size), chunk_overlap=int(chunk_overlap))
 
@@ -530,6 +504,7 @@ if st.button("Process Document") and st.session_state.text:
                 "filename": getattr(uploaded_file, "name", "unknown") if uploaded_file else "unknown",
                 "filetype": getattr(uploaded_file, "type", "unknown") if uploaded_file else "unknown",
                 "uploaded_at": datetime.utcnow().isoformat(),
+                "doc_id": st.session_state.get("current_doc_id"),
             }
 
             if st.session_state.page_texts:
@@ -562,22 +537,25 @@ if st.button("Process Document") and st.session_state.text:
                 if isinstance(st.session_state.vectorstore, FAISS):
                     save_faiss(st.session_state.vectorstore)
 
+            # ✅ critical: set robust marker that indexing succeeded
             st.session_state.doc_processed = True
-            ensure_vectorstore(kb_backend)
-            st.success(f"Stored {len(all_chunks)} chunks in KB.")
+            st.session_state.indexed_doc_id = st.session_state.get("current_doc_id")
+            st.session_state.indexed_chunks_count = len(all_chunks)
+
+            st.success(f"KB indexed for this document: {len(all_chunks)} chunks ✅")
         except Exception as e:
             st.error(f"Processing failed: {e}")
             st.exception(e)
 
 
 # =========================================================
-# TABS: Summary + Q&A
+# Tabs
 # =========================================================
 tab1, tab2 = st.tabs(["📝 Summary", "💬 Q&A (Chat)"])
 
 
 # =========================================================
-# SUMMARY TAB
+# Summary Tab
 # =========================================================
 with tab1:
     st.markdown("**Generate a summary of the uploaded document.**")
@@ -594,7 +572,7 @@ with tab1:
 
 
 # =========================================================
-# Q&A TAB
+# Q&A Tab (fixed indexing check + table 3 fallback)
 # =========================================================
 with tab2:
     st.markdown("**Ask about your document. For tables: “Explain Table 3 on page 7”.**")
@@ -608,25 +586,32 @@ with tab2:
         st.session_state.chat_history.append({"role": "user", "content": user_question})
         append_message(SESSION_ID, "user", user_question)
 
-        # Guard: if not processed OR KB empty
-        ensure_vectorstore(kb_backend)
-        if not st.session_state.doc_processed or kb_count_hint() == 0:
-            warn = "⚠️ Please upload and click **Process Document** first so the KB is indexed."
+        # ✅ Robust indexing check: based on our ingest marker, not Qdrant count
+        current_doc = st.session_state.get("current_doc_id")
+        if not (st.session_state.doc_processed and st.session_state.indexed_doc_id == current_doc and st.session_state.indexed_chunks_count > 0):
+            warn = "⚠️ Please upload and click **Process Document** first so the KB is indexed for this document."
             st.session_state.chat_history.append({"role": "assistant", "content": warn})
             append_message(SESSION_ID, "assistant", warn)
+            st.rerun()
+
+        ensure_vectorstore(kb_backend)
+        if st.session_state.vectorstore is None:
+            answer = "Knowledge base not ready (vector store missing)."
+            st.session_state.chat_history.append({"role": "assistant", "content": answer})
+            append_message(SESSION_ID, "assistant", answer)
             st.rerun()
 
         table_n = parse_table_number(user_question)
         page_n = parse_page_number(user_question)
 
-        # Retrieve
+        # Retrieve docs
         docs = []
         try:
             docs = st.session_state.vectorstore.similarity_search(user_question, k=int(top_k))
         except Exception:
             docs = []
 
-        # Build context with page headers (for citations) + sources panel
+        # Build context + sources
         context_lines = []
         sources = []
         for d in docs:
@@ -643,11 +628,11 @@ with tab2:
 
         st.session_state.last_sources = sources[:8]
 
-        # Runtime table fallback (Table 3 fix)
+        # Runtime table fallback if table requested but not in retrieved context
         if table_n is not None and st.session_state.last_pdf_bytes and hf_token:
             combined = "\n".join(context_lines)
             if not contains_specific_table(combined, table_n):
-                # candidate pages: page hint first + neighbors, then pages with "Table n" in text, else first 30 pages
+                # candidate pages: page hint first + neighbors; then pages containing "Table n" in text; else first 30 pages
                 candidate_pages: List[int] = []
                 if page_n is not None:
                     candidate_pages += [int(page_n), max(1, int(page_n)-1), int(page_n)+1]
@@ -656,7 +641,6 @@ with tab2:
                     p = int(item["page"])
                     if contains_specific_table(item.get("text", ""), table_n) and p not in candidate_pages:
                         candidate_pages.append(p)
-                        # also try next page (caption->table often follows)
                         if p+1 not in candidate_pages:
                             candidate_pages.append(p+1)
 
@@ -691,7 +675,7 @@ with tab2:
                         f"**Source:** {st.session_state.last_pdf_name or 'document'} (Page {best_page})"
                     )
 
-                    # Store runtime chunk for future retrieval
+                    # Store runtime chunk
                     try:
                         runtime_chunk = f"[TABLE_RUNTIME][TABLE {table_n}][PAGE {best_page}] {runtime_answer}"
                         meta = {
@@ -701,7 +685,8 @@ with tab2:
                             "uploaded_at": datetime.utcnow().isoformat(),
                             "chunk_type": "table_runtime",
                             "page": best_page,
-                            "table_number": table_n
+                            "table_number": table_n,
+                            "doc_id": st.session_state.get("current_doc_id"),
                         }
                         st.session_state.vectorstore.add_texts([runtime_chunk], metadatas=[meta])
                         if isinstance(st.session_state.vectorstore, FAISS):
@@ -720,14 +705,13 @@ with tab2:
                     append_message(SESSION_ID, "assistant", runtime_answer)
                     st.rerun()
 
-        # If still no excerpts, return actionable
+        # Normal grounded answer with page citations (no S1/S2)
         if not context_lines:
             answer = "Not found in the document excerpts. Increase Top K or ask with a page number."
             st.session_state.chat_history.append({"role": "assistant", "content": answer})
             append_message(SESSION_ID, "assistant", answer)
             st.rerun()
 
-        # Normal grounded answer with Page citations (no S1/S2)
         system = (
             "You are a precise assistant. Use ONLY the provided excerpts.\n"
             "Cite sources as (Page X) based on excerpt headers.\n"
