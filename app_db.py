@@ -1,24 +1,25 @@
 # app.py
 """
-FINAL FIXED + UNIFIED APP
+COMPLETE UNIFIED APP (DOES NOT REMOVE ORIGINAL FEATURES)
 
-Keeps original requirements/features:
+Original requirements preserved:
 ✅ Upload PDF/TXT
-✅ Process Document -> chunk + embed + store in KB
-✅ Summary tab
-✅ Q&A tab with persistent chat memory (SQLite)
-✅ Text LLM routing: HF Router -> Groq (primary) + Groq direct fallback
+✅ Process Document -> chunk + embed + store in KB (Qdrant or FAISS fallback)
+✅ Summary feature/tab
+✅ Q&A (Chat) tab with multi-turn memory (SQLite persistence)
+✅ Text LLM routing: HF Router -> Groq (primary) + Groq Direct fallback
 
-Adds (without removing base):
-✅ Dual vision models via HF Inference OpenAI-compatible endpoint:
-   - deepseek-ai/DeepSeek-OCR-2 for OCR + markdown conversion / parsing [1](https://www.geeksforgeeks.org/artificial-intelligence/how-to-get-a-groq-api-key/)[2](https://deepwiki.com/groq/groq-api-cookbook/1.1-getting-started)
-   - llava-hf/llava-v1.6-34b-hf for explanations / insights [3](https://portkey.ai/models/groq/llama-3.1-70b-versatile)
-✅ Runtime fallback: if KB doesn't contain Table/Figure, render PDF page and extract+explain in one-go
-✅ Ensures COMPLETE output with one continuation pass if truncated
-✅ Stores runtime extracted content back into KB automatically
-
-Important:
-- HF base64 images can hit 413 Payload Too Large => compress/resize always. [4](https://paravisionlab.co.in/text-summarizer/)
+Enhancements added (without removing anything):
+✅ Dual vision models (HF token):
+   - deepseek-ai/DeepSeek-OCR-2: OCR + markdown conversion / structured extraction
+   - llava-hf/llava-v1.6-34b-hf: explanation / visual reasoning
+✅ Runtime fallback for requested Table N / Figure N:
+   - If KB doesn’t contain *that specific* Table N (not just any table), render PDF page and extract+explain.
+   - Auto-insert runtime result into KB for future queries.
+✅ Completeness:
+   - One continuation pass if vision output appears truncated.
+✅ Fixes Table3-vs-Table9 issue:
+   - Checks for *requested number* before skipping runtime fallback.
 """
 
 import os
@@ -50,14 +51,14 @@ from qdrant_client.http import models as qmodels
 
 
 # =========================
-# Page config
+# Page config (keep original feel)
 # =========================
-st.set_page_config(page_title="Document Insights (Unified)", layout="wide")
+st.set_page_config(page_title="Document Summarization & Q&A", layout="wide")
 st.title("📄 Document Summarization & Q&A (Unified: DeepSeek OCR2 + LLaVA + Groq routing)")
 
 
 # =========================
-# Local FAISS persistence (fallback KB)
+# Local FAISS persistence (fallback)
 # =========================
 FAISS_DIR = Path("faiss_store")
 FAISS_DIR.mkdir(exist_ok=True)
@@ -72,7 +73,7 @@ def load_faiss(embeddings, path: Path = FAISS_DIR) -> Optional[FAISS]:
 
 
 # =========================
-# SQLite chat history (persistent)
+# SQLite chat memory persistence
 # =========================
 CHAT_DB_PATH = "chat_history.sqlite"
 
@@ -124,14 +125,15 @@ if "vectorstore" not in st.session_state:
     st.session_state.vectorstore = None
 if "kb_ready" not in st.session_state:
     st.session_state.kb_ready = False
+
 if "text" not in st.session_state:
     st.session_state.text = ""
 if "chunks" not in st.session_state:
     st.session_state.chunks = []
+
 if "debug_raw" not in st.session_state:
     st.session_state.debug_raw = False
 
-# chat + follow-up
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 if "last_retrieved_docs" not in st.session_state:
@@ -141,7 +143,7 @@ if "last_context_blocks" not in st.session_state:
 if "last_ref" not in st.session_state:
     st.session_state.last_ref = None  # "table 3" / "figure 2"
 
-# store uploaded pdf bytes for runtime fallback
+# keep uploaded PDF in-session for runtime fallback
 if "last_pdf_bytes" not in st.session_state:
     st.session_state.last_pdf_bytes = None
 if "last_pdf_name" not in st.session_state:
@@ -149,8 +151,8 @@ if "last_pdf_name" not in st.session_state:
 
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
-SESSION_ID = st.session_state.session_id
 
+SESSION_ID = st.session_state.session_id
 init_chat_db()
 if "history_synced" not in st.session_state:
     st.session_state.chat_history = load_history(SESSION_ID)
@@ -186,7 +188,7 @@ def llm_chat_with_fallback(
 ):
     result = {"content": "", "primary_used": False, "raw": None, "error_primary": None, "error_fallback": None}
 
-    # Primary: HF Router -> Groq
+    # Primary: HF Router -> Groq provider
     if hf_token:
         try:
             hf_client = OpenAI(base_url="https://router.huggingface.co/v1", api_key=hf_token)
@@ -221,16 +223,14 @@ def llm_chat_with_fallback(
 
 
 # =========================
-# Vision models via HF Inference (OpenAI compatible)
+# Vision models (HF Inference OpenAI-compatible)
 # =========================
 HF_INFER_BASE = "https://api-inference.huggingface.co/v1/"
-DEEPSEEK_OCR_MODEL = "deepseek-ai/DeepSeek-OCR-2"  # [1](https://www.geeksforgeeks.org/artificial-intelligence/how-to-get-a-groq-api-key/)[2](https://deepwiki.com/groq/groq-api-cookbook/1.1-getting-started)
-LLAVA_MODEL = "llava-hf/llava-v1.6-34b-hf"        # [3](https://portkey.ai/models/groq/llama-3.1-70b-versatile)
+DEEPSEEK_OCR_MODEL = "deepseek-ai/DeepSeek-OCR-2"
+LLAVA_MODEL = "llava-hf/llava-v1.6-34b-hf"
 
 def image_to_data_url(img: Image.Image, max_bytes: int = 650_000) -> str:
-    """
-    Downscale/compress to reduce HF 413 Payload Too Large with base64 images. [4](https://paravisionlab.co.in/text-summarizer/)
-    """
+    """Compress + downscale to reduce 413 Payload Too Large risk."""
     img = img.convert("RGB")
     max_side = 1300
     w, h = img.size
@@ -254,12 +254,9 @@ def image_to_data_url(img: Image.Image, max_bytes: int = 650_000) -> str:
 
 def hf_vision_chat(hf_token: str, model: str, img: Image.Image, prompt: str,
                    max_tokens: int = 1200, retries: int = 2) -> str:
-    """
-    Calls HF Inference OpenAI-compatible endpoint with image_url + text blocks. [5](https://console.groq.com/docs/text-chat)
-    """
+    """Call HF OpenAI-compatible endpoint with image_url + text blocks."""
     if not hf_token:
         return ""
-
     data_url = image_to_data_url(img)
     client = OpenAI(base_url=HF_INFER_BASE, api_key=hf_token)
 
@@ -289,7 +286,6 @@ def hf_vision_chat(hf_token: str, model: str, img: Image.Image, prompt: str,
     return ""
 
 def looks_truncated(s: str) -> bool:
-    """Heuristic: if ends without punctuation or ends mid-word/ellipsis, likely truncated."""
     if not s:
         return False
     tail = s.strip()[-40:]
@@ -301,15 +297,12 @@ def looks_truncated(s: str) -> bool:
 
 def hf_vision_chat_with_continue(hf_token: str, model: str, img: Image.Image, prompt: str,
                                  max_tokens: int = 1200) -> str:
-    """
-    One-go completeness: run once, and if output looks truncated, run one continuation call.
-    """
+    """One continuation pass if output seems truncated."""
     out1 = hf_vision_chat(hf_token, model, img, prompt, max_tokens=max_tokens, retries=2)
     if looks_truncated(out1):
         cont_prompt = (
             prompt
-            + "\n\nThe previous output may be cut off. Continue from where you left off. "
-            "Do NOT repeat already written content; only continue."
+            + "\n\nContinue EXACTLY from where you left off. Do NOT repeat earlier text."
         )
         out2 = hf_vision_chat(hf_token, model, img, cont_prompt, max_tokens=max_tokens, retries=2)
         if out2 and out2 not in out1:
@@ -318,7 +311,7 @@ def hf_vision_chat_with_continue(hf_token: str, model: str, img: Image.Image, pr
 
 
 # =========================
-# Parse references (table/figure/page)
+# Parse references (Table/Figure/Page)
 # =========================
 TABLE_REF_RE = re.compile(r"\b(?:table|tab\.?)\s*(\d+)\b", re.IGNORECASE)
 FIGURE_REF_RE = re.compile(r"\b(?:figure|fig\.?)\s*(\d+)\b", re.IGNORECASE)
@@ -350,9 +343,50 @@ def is_visual_question(q: str) -> bool:
 
 
 # =========================
-# Render PDF page to image for runtime fallback
+# FIX: check for SPECIFIC requested table/figure (solves Table3 vs Table9)
 # =========================
-def render_pdf_page(pdf_bytes: bytes, page_num_1based: int, dpi: int = 280) -> Optional[Image.Image]:
+def table_pat(n: int):
+    return re.compile(rf"\b(tab(?:le)?\.?)\s*{n}\b", re.IGNORECASE)
+
+def figure_pat(n: int):
+    return re.compile(rf"\b(fig(?:ure)?\.?)\s*{n}\b", re.IGNORECASE)
+
+def has_specific_table(blocks: List[str], table_n: int) -> bool:
+    pat = table_pat(table_n)
+    for b in blocks:
+        if pat.search(b):
+            return True
+        if f"[TABLE_RUNTIME][TABLE {table_n}]" in b:
+            return True
+    return False
+
+def has_specific_table_on_page(blocks: List[str], table_n: int, page_n: Optional[int]) -> bool:
+    if page_n is None:
+        return has_specific_table(blocks, table_n)
+    for b in blocks:
+        if f"[TABLE_RUNTIME][TABLE {table_n}][PAGE {page_n}]" in b:
+            return True
+    # loose match: "Table n" and "page x" both mentioned
+    pat = table_pat(table_n)
+    for b in blocks:
+        if pat.search(b) and re.search(rf"\bpage\s*{page_n}\b", b, re.IGNORECASE):
+            return True
+    return False
+
+def has_specific_figure(blocks: List[str], fig_n: int) -> bool:
+    pat = figure_pat(fig_n)
+    for b in blocks:
+        if pat.search(b):
+            return True
+        if f"[FIGURE_RUNTIME][FIGURE {fig_n}]" in b:
+            return True
+    return False
+
+
+# =========================
+# Render PDF page -> image for runtime fallback
+# =========================
+def render_pdf_page(pdf_bytes: bytes, page_num_1based: int, dpi: int = 300) -> Optional[Image.Image]:
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         idx = page_num_1based - 1
@@ -459,7 +493,7 @@ def retrieve_docs(vectorstore, query: str, k: int, prefer_visual: bool) -> List:
     except Exception:
         return []
 
-    # De-dup
+    # de-dup
     seen = set()
     uniq = []
     for d in docs_all:
@@ -484,7 +518,7 @@ def retrieve_docs(vectorstore, query: str, k: int, prefer_visual: bool) -> List:
 
 
 # =========================
-# Summary helper (restored)
+# Summary prompt (restored)
 # =========================
 def build_summary_prompt(text: str) -> list[dict]:
     return [
@@ -494,7 +528,37 @@ def build_summary_prompt(text: str) -> list[dict]:
 
 
 # =========================
-# Sidebar controls (restored + kept)
+# Runtime extractors (Dual model)
+# =========================
+def runtime_extract_table_md(hf_token: str, img: Image.Image, table_n: int) -> str:
+    prompt = f"<image>\n<|grounding|>Convert the document to markdown.\nFocus on Table {table_n}."
+    return hf_vision_chat_with_continue(hf_token, DEEPSEEK_OCR_MODEL, img, prompt, max_tokens=1800)
+
+def runtime_explain_table(hf_token: str, img: Image.Image, table_md: str, table_n: int) -> str:
+    prompt = (
+        f"This image contains Table {table_n}. Explain the table in detail.\n"
+        "Use the extracted markdown table below as grounding:\n\n"
+        f"{table_md}\n\n"
+        "Explain: columns meaning, key values, comparisons, patterns, and takeaway."
+    )
+    return hf_vision_chat_with_continue(hf_token, LLAVA_MODEL, img, prompt, max_tokens=1200)
+
+def runtime_extract_figure(hf_token: str, img: Image.Image, fig_n: int) -> str:
+    prompt = f"<image>\nParse the figure. Figure {fig_n}. Extract labels/axes/legend and key elements."
+    return hf_vision_chat_with_continue(hf_token, DEEPSEEK_OCR_MODEL, img, prompt, max_tokens=1400)
+
+def runtime_explain_figure(hf_token: str, img: Image.Image, fig_text: str, fig_n: int) -> str:
+    prompt = (
+        f"This image contains Figure {fig_n}. Explain it clearly.\n"
+        "Use the extracted details below as grounding:\n\n"
+        f"{fig_text}\n\n"
+        "Now provide: what it shows, axes/legend, key trends, and takeaway."
+    )
+    return hf_vision_chat_with_continue(hf_token, LLAVA_MODEL, img, prompt, max_tokens=1000)
+
+
+# =========================
+# Sidebar (keep original controls)
 # =========================
 st.sidebar.header("KB Backend")
 kb_backend = st.sidebar.selectbox("Knowledge Base storage", ["Qdrant Cloud (API key)", "FAISS (Local fallback)"], index=0)
@@ -503,12 +567,12 @@ st.sidebar.markdown("---")
 st.sidebar.header("Processing Options")
 chunk_size = st.sidebar.number_input("Chunk size", 200, 4000, 1000, 100)
 chunk_overlap = st.sidebar.number_input("Chunk overlap", 0, 1000, 200, 50)
-top_k = st.sidebar.number_input("Top K retrieval", 1, 12, 6, 1)
+top_k = st.sidebar.number_input("Top K documents for retrieval", 1, 12, 6, 1)
 scan_pages_limit = st.sidebar.number_input("Max pages to scan if page not specified", 1, 80, 25, 1)
 
 st.sidebar.markdown("---")
 st.sidebar.header("LLM Options")
-model_id = st.sidebar.text_input("Model ID (text LLM)", value="openai/gpt-oss-20b")
+model_id = st.sidebar.text_input("Model ID", value="openai/gpt-oss-20b")
 max_tokens = st.sidebar.slider("Max output tokens", 64, 4096, 1024, 64)
 temperature = st.sidebar.slider("Temperature", 0.0, 1.5, 0.2, 0.1)
 st.session_state.debug_raw = st.sidebar.checkbox("Debug", value=False)
@@ -530,9 +594,8 @@ if st.sidebar.button("🧹 Clear chat history"):
 # =========================
 hf_token = get_secret("HUGGINGFACE_API_TOKEN", None)
 groq_key = get_secret("GROQ_API_KEY", None)
-
 if not hf_token:
-    st.warning("⚠️ HUGGINGFACE_API_TOKEN missing. Vision runtime extraction won't work.")
+    st.warning("⚠️ HUGGINGFACE_API_TOKEN missing. Runtime table/figure extraction won't work.")
 if not groq_key:
     st.warning("ℹ️ GROQ_API_KEY missing. Groq fallback won't work if HF Router fails.")
 
@@ -544,7 +607,7 @@ ensure_vectorstore(kb_backend)
 
 
 # =========================
-# Upload + Process Document (restored)
+# Upload + Process Document (kept)
 # =========================
 uploaded_file = st.file_uploader("Upload Document (PDF or TXT)", type=["pdf", "txt"])
 
@@ -555,7 +618,6 @@ if uploaded_file:
             st.session_state.last_pdf_bytes = pdf_bytes
             st.session_state.last_pdf_name = uploaded_file.name
 
-            # Basic text extraction for summary & KB chunking (native text only)
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
             pages_text = []
             for i in range(doc.page_count):
@@ -563,6 +625,7 @@ if uploaded_file:
                 pages_text.append(page.get_text("text"))
             doc.close()
             st.session_state.text = "\n\n".join(pages_text).strip()
+
         else:
             st.session_state.text = uploaded_file.read().decode("utf-8", errors="replace")
             st.session_state.last_pdf_bytes = None
@@ -608,13 +671,13 @@ if st.button("Process Document") and st.session_state.text:
 
 
 # =========================
-# Tabs (Summary restored + Q&A)
+# Tabs (Summary kept + Q&A)
 # =========================
 tab1, tab2 = st.tabs(["📝 Summary", "💬 Q&A (Chat)"])
 
 
 # =========================
-# Summary Tab (restored)
+# Summary Tab (kept)
 # =========================
 with tab1:
     st.markdown("**Generate a summary of the uploaded document.**")
@@ -627,10 +690,10 @@ with tab1:
         else:
             with st.spinner("Summarizing..."):
                 if use_chunked_summary:
-                    # ensure chunks exist
                     if not st.session_state.chunks:
                         splitter = RecursiveCharacterTextSplitter(chunk_size=int(chunk_size), chunk_overlap=int(chunk_overlap))
                         st.session_state.chunks = splitter.split_text(st.session_state.text)
+
                     n = min(12, len(st.session_state.chunks))
                     mini = []
                     for i in range(n):
@@ -672,43 +735,10 @@ with tab1:
 
 
 # =========================
-# Runtime (Table/Figure) extractors using both models
-# =========================
-def runtime_extract_table_markdown(hf_token: str, img: Image.Image, table_n: int) -> str:
-    # DeepSeek OCR2: markdown conversion / OCR prompts [1](https://www.geeksforgeeks.org/artificial-intelligence/how-to-get-a-groq-api-key/)[2](https://deepwiki.com/groq/groq-api-cookbook/1.1-getting-started)
-    prompt = f"<image>\n<|grounding|>Convert the document to markdown.\nFocus on Table {table_n}."
-    return hf_vision_chat_with_continue(hf_token, DEEPSEEK_OCR_MODEL, img, prompt, max_tokens=1800)
-
-def runtime_explain_table(hf_token: str, img: Image.Image, table_md: str, table_n: int) -> str:
-    # LLaVA: explain meaning; expects image+prompt style [3](https://portkey.ai/models/groq/llama-3.1-70b-versatile)
-    prompt = (
-        f"This image contains Table {table_n}. "
-        "Explain the table in detail.\n"
-        "Use the extracted markdown table below as grounding:\n\n"
-        f"{table_md}\n\n"
-        "Explain: columns meaning, key values, comparisons, patterns, and takeaway."
-    )
-    return hf_vision_chat_with_continue(hf_token, LLAVA_MODEL, img, prompt, max_tokens=1200)
-
-def runtime_extract_figure(hf_token: str, img: Image.Image, fig_n: int) -> str:
-    prompt = f"<image>\nParse the figure. Figure {fig_n}. Extract labels/axes/legend and key elements."
-    return hf_vision_chat_with_continue(hf_token, DEEPSEEK_OCR_MODEL, img, prompt, max_tokens=1400)
-
-def runtime_explain_figure(hf_token: str, img: Image.Image, fig_text: str, fig_n: int) -> str:
-    prompt = (
-        f"This image contains Figure {fig_n}. Explain it clearly.\n"
-        "Use the extracted details below as grounding:\n\n"
-        f"{fig_text}\n\n"
-        "Now provide: what it shows, axes/legend, key trends, and takeaway."
-    )
-    return hf_vision_chat_with_continue(hf_token, LLAVA_MODEL, img, prompt, max_tokens=1000)
-
-
-# =========================
-# Q&A Tab (fixed: complete answers)
+# Q&A Tab (fixed: table-specific detection + complete runtime output)
 # =========================
 with tab2:
-    st.markdown("**Ask about your document. For deterministic table answers use: “Explain Table 3 on page 7”**")
+    st.markdown("**Ask about your document. For deterministic answers use: “Explain Table 3 on page 7”.**")
 
     for msg in st.session_state.chat_history:
         with st.chat_message("user" if msg["role"] == "user" else "assistant"):
@@ -740,7 +770,7 @@ with tab2:
 
         reuse_prior = (ref is not None and ref == st.session_state.last_ref and len(st.session_state.last_context_blocks) > 0)
 
-        # 1) RAG retrieval
+        # 1) Retrieve normally
         k = max(int(top_k), 10) if prefer_visual else int(top_k)
         docs = retrieve_docs(st.session_state.vectorstore, user_question, k=k, prefer_visual=prefer_visual)
 
@@ -766,90 +796,89 @@ with tab2:
         pdf_bytes = st.session_state.last_pdf_bytes
         pdf_name = st.session_state.last_pdf_name or "uploaded.pdf"
 
-        def kb_has_table(blocks: List[str]) -> bool:
-            return any("TABLE_" in b or "table" in b.lower() for b in blocks)
-
-        def kb_has_figure(blocks: List[str]) -> bool:
-            return any("FIGURE_" in b or "figure" in b.lower() for b in blocks)
-
         runtime_text_answer = None
         runtime_chunk_to_store = None
         runtime_meta = None
 
-        # 2) Runtime fallback (guaranteed full) when table/figure missing
-        if table_n is not None and (not kb_has_table(context_blocks)) and pdf_bytes and hf_token:
-            # if user gives page number => one-go correct
-            target_page = page_n
-            if target_page is None:
-                # scan pages using LLaVA YES/NO locator
-                try:
-                    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-                    scan_pages = min(int(scan_pages_limit), doc.page_count)
-                    doc.close()
-                except Exception:
-                    scan_pages = int(scan_pages_limit)
+        # 2) FIXED runtime fallback trigger:
+        # Trigger ONLY if the requested table/figure number is missing (not blocked by other tables)
+        if table_n is not None and pdf_bytes and hf_token:
+            table_missing = not has_specific_table_on_page(context_blocks, table_n, page_n)
+            if table_missing:
+                # locate page
+                target_page = page_n
+                if target_page is None:
+                    # scan pages using cheap locator on LLaVA
+                    try:
+                        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+                        scan_pages = min(int(scan_pages_limit), doc.page_count)
+                        doc.close()
+                    except Exception:
+                        scan_pages = int(scan_pages_limit)
 
-                found = None
-                for p in range(1, scan_pages + 1):
-                    img = render_pdf_page(pdf_bytes, p, dpi=220)
-                    if img is None:
-                        continue
-                    locator = hf_vision_chat(hf_token, LLAVA_MODEL, img,
-                                             f"Does this page contain Table {table_n}? Answer only YES or NO.",
-                                             max_tokens=10, retries=1).strip().upper()
-                    if locator.startswith("YES"):
-                        found = p
-                        break
-                target_page = found
+                    found = None
+                    for p in range(1, scan_pages + 1):
+                        img = render_pdf_page(pdf_bytes, p, dpi=220)
+                        if img is None:
+                            continue
+                        locator = hf_vision_chat(hf_token, LLAVA_MODEL, img,
+                                                 f"Does this page contain Table {table_n}? Answer only YES or NO.",
+                                                 max_tokens=10, retries=1).strip().upper()
+                        if locator.startswith("YES"):
+                            found = p
+                            break
+                    target_page = found
 
-            if target_page is not None:
-                img = render_pdf_page(pdf_bytes, target_page, dpi=300)
-                if img is not None:
-                    table_md = runtime_extract_table_markdown(hf_token, img, table_n)
-                    table_expl = runtime_explain_table(hf_token, img, table_md, table_n)
+                if target_page is not None:
+                    img = render_pdf_page(pdf_bytes, target_page, dpi=300)
+                    if img is not None:
+                        table_md = runtime_extract_table_md(hf_token, img, table_n)
+                        table_expl = runtime_explain_table(hf_token, img, table_md, table_n)
 
-                    runtime_text_answer = (
-                        f"### ✅ Table {table_n} (Page {target_page})\n\n"
-                        f"#### Extracted (DeepSeek OCR‑2)\n{table_md}\n\n"
-                        f"#### Explanation (LLaVA)\n{table_expl}"
-                    )
+                        runtime_text_answer = (
+                            f"### ✅ Table {table_n} (Page {target_page})\n\n"
+                            f"#### Extracted (DeepSeek OCR‑2)\n{table_md}\n\n"
+                            f"#### Explanation (LLaVA)\n{table_expl}"
+                        )
 
-                    runtime_chunk_to_store = f"[TABLE_RUNTIME][TABLE {table_n}][PAGE {target_page}] {runtime_text_answer}"
-                    runtime_meta = {
-                        "source": "runtime_ocr",
-                        "filename": pdf_name,
-                        "chunk_type": "table_runtime",
-                        "table_number": table_n,
-                        "page": target_page,
-                        "created_at": datetime.utcnow().isoformat(),
-                    }
+                        runtime_chunk_to_store = f"[TABLE_RUNTIME][TABLE {table_n}][PAGE {target_page}] {runtime_text_answer}"
+                        runtime_meta = {
+                            "source": "runtime_ocr",
+                            "filename": pdf_name,
+                            "chunk_type": "table_runtime",
+                            "table_number": table_n,
+                            "page": target_page,
+                            "created_at": datetime.utcnow().isoformat(),
+                        }
 
-        elif fig_n is not None and (not kb_has_figure(context_blocks)) and pdf_bytes and hf_token:
-            target_page = page_n
-            if target_page is not None:
-                img = render_pdf_page(pdf_bytes, target_page, dpi=260)
-                if img is not None:
-                    fig_text = runtime_extract_figure(hf_token, img, fig_n)
-                    fig_expl = runtime_explain_figure(hf_token, img, fig_text, fig_n)
+        if fig_n is not None and pdf_bytes and hf_token:
+            fig_missing = not has_specific_figure(context_blocks, fig_n)
+            if fig_missing:
+                target_page = page_n
+                if target_page is not None:
+                    img = render_pdf_page(pdf_bytes, target_page, dpi=260)
+                    if img is not None:
+                        fig_text = runtime_extract_figure(hf_token, img, fig_n)
+                        fig_expl = runtime_explain_figure(hf_token, img, fig_text, fig_n)
 
-                    runtime_text_answer = (
-                        f"### ✅ Figure {fig_n} (Page {target_page})\n\n"
-                        f"#### Extracted (DeepSeek OCR‑2)\n{fig_text}\n\n"
-                        f"#### Explanation (LLaVA)\n{fig_expl}"
-                    )
-                    runtime_chunk_to_store = f"[FIGURE_RUNTIME][FIGURE {fig_n}][PAGE {target_page}] {runtime_text_answer}"
-                    runtime_meta = {
-                        "source": "runtime_ocr",
-                        "filename": pdf_name,
-                        "chunk_type": "figure_runtime",
-                        "figure_number": fig_n,
-                        "page": target_page,
-                        "created_at": datetime.utcnow().isoformat(),
-                    }
+                        runtime_text_answer = (
+                            f"### ✅ Figure {fig_n} (Page {target_page})\n\n"
+                            f"#### Extracted (DeepSeek OCR‑2)\n{fig_text}\n\n"
+                            f"#### Explanation (LLaVA)\n{fig_expl}"
+                        )
 
-        # 3) If runtime produced a complete answer: return it directly (fixes truncation + one-go)
+                        runtime_chunk_to_store = f"[FIGURE_RUNTIME][FIGURE {fig_n}][PAGE {target_page}] {runtime_text_answer}"
+                        runtime_meta = {
+                            "source": "runtime_ocr",
+                            "filename": pdf_name,
+                            "chunk_type": "figure_runtime",
+                            "figure_number": fig_n,
+                            "page": target_page,
+                            "created_at": datetime.utcnow().isoformat(),
+                        }
+
+        # 3) If runtime produced a complete answer, show it directly (prevents truncation)
         if runtime_text_answer:
-            # store in KB for future
             try:
                 st.session_state.vectorstore.add_texts([runtime_chunk_to_store], metadatas=[runtime_meta])
                 if isinstance(st.session_state.vectorstore, FAISS):
@@ -866,9 +895,9 @@ with tab2:
             st.session_state.last_ref = ref or st.session_state.last_ref
             st.rerun()
 
-        # 4) Otherwise, normal grounded RAG answer
+        # 4) Otherwise, normal grounded RAG
         if not context_blocks:
-            answer = "Not found in the knowledge base. (Tip: include page number like 'Table 3 on page 7')"
+            answer = "Not found in the knowledge base. Tip: include page number like 'Table 3 on page 7'."
             st.session_state.chat_history.append({"role": "assistant", "content": answer})
             append_message(SESSION_ID, "assistant", answer)
             st.session_state.last_retrieved_docs = []
@@ -899,5 +928,4 @@ with tab2:
         st.session_state.last_retrieved_docs = last_snips[:8]
         st.session_state.last_context_blocks = context_blocks
         st.session_state.last_ref = ref or st.session_state.last_ref
-
         st.rerun()
